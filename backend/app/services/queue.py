@@ -5,7 +5,11 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
-import redis.asyncio as aioredis
+try:
+    import redis.asyncio as aioredis
+except ImportError:
+    aioredis = None
+
 from backend.app.core.config import settings
 from backend.app.services.event_stream import stream_broker
 
@@ -48,10 +52,10 @@ class EventQueue:
 
     async def connect(self) -> bool:
         """Attempts connection to Redis. Switches to in-memory fallback on failure."""
-        if not settings.USE_REDIS_QUEUE:
+        if not settings.USE_REDIS_QUEUE or aioredis is None:
             self._is_redis_available = False
             self.metrics["backend"] = "in_memory"
-            logger.info("EventQueue configured for in-memory mode via settings.")
+            logger.info("EventQueue configured for in-memory mode.")
             return False
 
         try:
