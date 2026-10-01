@@ -12,6 +12,7 @@ from backend.app.utils.signature import verify_signature
 from backend.app.services.encryption import decrypt_token
 from backend.app.services.queue import event_queue
 from backend.app.services.event_stream import stream_broker
+from backend.app.core.config import settings
 
 logger = logging.getLogger("app.api.v1.webhooks")
 router = APIRouter()

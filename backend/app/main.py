@@ -1,9 +1,19 @@
 import logging
 import sys
+import types
 from pathlib import Path
 
-# Resolve absolute backend package imports when running from within the backend directory
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+# Resolve absolute backend package imports when running locally or on Vercel (/var/task)
+_backend_root = Path(__file__).resolve().parent.parent
+if str(_backend_root.parent) not in sys.path:
+    sys.path.insert(0, str(_backend_root.parent))
+if str(_backend_root) not in sys.path:
+    sys.path.insert(0, str(_backend_root))
+
+if "backend" not in sys.modules:
+    _backend_pkg = types.ModuleType("backend")
+    _backend_pkg.__path__ = [str(_backend_root)]
+    sys.modules["backend"] = _backend_pkg
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
