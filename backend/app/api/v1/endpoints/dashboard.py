@@ -5,6 +5,7 @@ from typing import List, Dict, Any
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.api.deps import get_db, get_current_user
 from backend.app.models.user import User
@@ -94,6 +95,7 @@ async def get_recent_events(
 
     events_query = await db.execute(
         select(WebhookEvent)
+        .options(selectinload(WebhookEvent.action_logs))
         .where(WebhookEvent.repository_id.in_(repo_ids))
         .order_by(WebhookEvent.created_at.desc())
         .limit(limit)
@@ -103,11 +105,6 @@ async def get_recent_events(
 
     serialized_events = []
     for event in events:
-        action_logs_query = await db.execute(
-            select(ActionLog).where(ActionLog.webhook_event_id == event.id)
-        )
-        logs = action_logs_query.scalars().all()
-
         serialized_events.append({
             "id": str(event.id),
             "delivery_id": str(event.delivery_id),
@@ -125,7 +122,7 @@ async def get_recent_events(
                     "status": log.status,
                     "details": log.details,
                     "created_at": log.created_at
-                } for log in logs
+                } for log in event.action_logs
             ]
         })
 

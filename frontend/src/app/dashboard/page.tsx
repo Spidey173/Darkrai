@@ -121,10 +121,11 @@ export default function OverviewPage() {
 
   const fetchTelemetry = async () => {
     try {
-      const [statsRes, eventsRes, queueRes] = await Promise.all([
+      const [statsRes, eventsRes, queueRes, logsRes] = await Promise.all([
         fetch('/api/v1/dashboard/stats'),
         fetch('/api/v1/dashboard/events?limit=15'),
         fetch('/api/v1/dashboard/queue'),
+        fetch('/api/v1/dashboard/logs'),
       ]);
       if (statsRes.ok && eventsRes.ok) {
         const [statsData, eventsData] = await Promise.all([
@@ -138,6 +139,17 @@ export default function OverviewPage() {
         const qData = await queueRes.json();
         setQueueMetrics(qData);
       }
+      if (logsRes.ok) {
+        const logsData = await logsRes.json();
+        if (Array.isArray(logsData) && logsData.length > 0) {
+          setLogs((prev) => {
+            const seen = new Set(prev.map((l) => `${l.timestamp}-${l.type}`));
+            const fresh = logsData.filter((l: LogMessage) => !seen.has(`${l.timestamp}-${l.type}`));
+            return [...prev, ...fresh].slice(-100);
+          });
+        }
+      }
+      setIsLiveConnected(true);
     } catch (e) {
       console.error('Failed to load dashboard telemetry:', e);
     } finally {
@@ -145,12 +157,12 @@ export default function OverviewPage() {
     }
   };
 
-  // Setup Server-Sent Events (SSE) live stream connection
+  // Setup live telemetry sync
   useEffect(() => {
     fetchTelemetry();
-    const interval = setInterval(fetchTelemetry, 10000);
+    const interval = setInterval(fetchTelemetry, 8000);
 
-    // Initial mock logs for immediate demonstration context
+    // Initial contextual logs for immediate terminal visualization
     setLogs([
       {
         type: 'system:ready',
@@ -172,26 +184,24 @@ export default function OverviewPage() {
       }
     ]);
 
-    // Connect to SSE stream endpoint
+    // Use SSE stream in development or supported streaming environments
     let eventSource: EventSource | null = null;
-    try {
-      eventSource = new EventSource('/api/v1/dashboard/stream');
-      eventSource.onopen = () => {
-        setIsLiveConnected(true);
-      };
-      eventSource.onmessage = (e) => {
-        try {
-          const parsed = JSON.parse(e.data);
-          setLogs((prev) => [...prev.slice(-99), parsed]);
-        } catch {
-          // ignore non-json heartbeats
-        }
-      };
-      eventSource.onerror = () => {
-        setIsLiveConnected(false);
-      };
-    } catch {
-      setIsLiveConnected(false);
+    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
+      try {
+        eventSource = new EventSource('/api/v1/dashboard/stream');
+        eventSource.onopen = () => setIsLiveConnected(true);
+        eventSource.onmessage = (e) => {
+          try {
+            const parsed = JSON.parse(e.data);
+            setLogs((prev) => [...prev.slice(-99), parsed]);
+          } catch {
+            // ignore non-json heartbeats
+          }
+        };
+        eventSource.onerror = () => setIsLiveConnected(false);
+      } catch {
+        // SSE fallback handled by polling
+      }
     }
 
     return () => {

@@ -163,7 +163,10 @@ async def github_callback(
     # Create redirection target to frontend
     redirect_target = "/dashboard"
     if settings.BACKEND_CORS_ORIGINS:
-        redirect_target = f"{settings.BACKEND_CORS_ORIGINS[0]}/dashboard"
+        for origin in settings.BACKEND_CORS_ORIGINS:
+            if origin.startswith("http://") or origin.startswith("https://"):
+                redirect_target = f"{origin.rstrip('/')}/dashboard"
+                break
 
     redirect_response = RedirectResponse(url=redirect_target)
     

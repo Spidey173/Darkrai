@@ -6,12 +6,25 @@ import { Flame, Webhook, Zap, GitBranch, ArrowRight, Github } from 'lucide-react
 import styles from '../styles/landing.module.css';
 
 export default function Home() {
-  const [authState, setAuthState] = useState<'loading' | 'authenticated' | 'guest'>('loading');
+  const [authState, setAuthState] = useState<'loading' | 'authenticated' | 'guest'>('guest');
 
   useEffect(() => {
-    fetch('/api/v1/auth/me')
-      .then((res) => setAuthState(res.ok ? 'authenticated' : 'guest'))
-      .catch(() => setAuthState('guest'));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+
+    fetch('/api/v1/auth/me', { signal: controller.signal })
+      .then((res) => {
+        clearTimeout(timer);
+        if (res.ok) setAuthState('authenticated');
+      })
+      .catch(() => {
+        // Silently retain guest status on abort/unauthenticated
+      });
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, []);
 
   return (
