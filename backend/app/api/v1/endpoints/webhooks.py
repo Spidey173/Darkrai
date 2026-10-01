@@ -3,6 +3,7 @@ import logging
 import uuid as _uuid_module
 from fastapi import APIRouter, Request, Header, HTTPException, status, Depends, Response
 from sqlalchemy import select
+from sqlalchemy.orm import joinedload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.deps import get_db
@@ -41,7 +42,9 @@ async def github_webhook_receiver(
         )
 
     result = await db.execute(
-        select(Repository).where(Repository.full_name == repo_name)
+        select(Repository)
+        .options(joinedload(Repository.user), selectinload(Repository.rules))
+        .where(Repository.full_name == repo_name)
     )
     repo = result.scalar_one_or_none()
     if not repo:
@@ -112,9 +115,17 @@ async def github_webhook_receiver(
             }
         )
         if settings.VERCEL:
-            import asyncio
             from backend.app.services.event_processor import process_webhook_event
-            asyncio.create_task(process_webhook_event(str(new_event.id)))
+            try:
+                await process_webhook_event(
+                    event_id=str(new_event.id),
+                    db=db,
+                    event=new_event,
+                    repository=repo,
+                    owner_user=repo.user
+                )
+            except Exception as proc_err:
+                logger.error("Failed processing event inline on Vercel: %s", proc_err, exc_info=True)
 
         return {
             "detail": "Webhook event accepted and queued for processing.",
