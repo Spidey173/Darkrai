@@ -35,11 +35,13 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Could not auto-create tables: %s", e)
 
-    # Launch background distributed queue worker
-    await event_queue.start_worker()
+    # Launch background distributed queue worker (disabled in serverless Vercel function)
+    if not settings.VERCEL:
+        await event_queue.start_worker()
     yield
     # Graceful shutdown of queue worker
-    await event_queue.stop_worker()
+    if not settings.VERCEL:
+        await event_queue.stop_worker()
 
 # Instantiate FastAPI application
 app = FastAPI(

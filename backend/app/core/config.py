@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     # Database config (defaults to local aiosqlite for zero-config startup and test isolation)
     DATABASE_URL: str = "sqlite+aiosqlite:///./darkrai.db"
 
+    # Serverless runtime detection (Vercel sets VERCEL=1)
+    VERCEL: bool = False
+
     # Redis Queue config (defaults to standard Redis URL, with resilient async in-memory fallback)
     REDIS_URL: str = "redis://localhost:6379/0"
     USE_REDIS_QUEUE: bool = True

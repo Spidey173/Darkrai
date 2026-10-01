@@ -110,6 +110,11 @@ async def github_webhook_receiver(
                 "repo": repo_name
             }
         )
+        if settings.VERCEL:
+            import asyncio
+            from backend.app.services.event_processor import process_webhook_event
+            asyncio.create_task(process_webhook_event(str(new_event.id)))
+
         return {
             "detail": "Webhook event accepted and queued for processing.",
             "event_id": str(new_event.id),
