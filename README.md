@@ -1,5 +1,4 @@
-# Darkrai
-### Event-Driven GitHub Automation Platform
+# Darkrai - Event-Driven GitHub Automation Platform
 
 ### Live Demo: [https://darkrai-one.vercel.app/](https://darkrai-one.vercel.app/)
 
