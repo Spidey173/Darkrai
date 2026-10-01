@@ -114,18 +114,19 @@ async def github_webhook_receiver(
                 "repo": repo_name
             }
         )
-        if settings.VERCEL:
-            from backend.app.services.event_processor import process_webhook_event
-            try:
-                await process_webhook_event(
-                    event_id=str(new_event.id),
-                    db=db,
-                    event=new_event,
-                    repository=repo,
-                    owner_user=repo.user
-                )
-            except Exception as proc_err:
-                logger.error("Failed processing event inline on Vercel: %s", proc_err, exc_info=True)
+        # Always execute inline to ensure serverless runtimes (e.g. Vercel) and 
+        # single-container deployments execute automation rules reliably before the response cycle ends.
+        from backend.app.services.event_processor import process_webhook_event
+        try:
+            await process_webhook_event(
+                event_id=str(new_event.id),
+                db=db,
+                event=new_event,
+                repository=repo,
+                owner_user=repo.user
+            )
+        except Exception as proc_err:
+            logger.error("Failed processing event inline: %s", proc_err, exc_info=True)
 
         return {
             "detail": "Webhook event accepted and queued for processing.",

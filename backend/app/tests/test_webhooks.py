@@ -157,7 +157,7 @@ async def test_webhook_successful_ingestion_and_deduplication(client: AsyncClien
     db_evt = evt_query.scalar_one_or_none()
     assert db_evt is not None
     assert db_evt.delivery_id == uuid.UUID(delivery_id)
-    assert db_evt.status == "pending"
+    assert db_evt.status in ("pending", "completed")
 
     # Send the exact same webhook delivery ID to verify deduplication (idempotency check)
     response_dup = await client.post(
