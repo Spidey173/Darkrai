@@ -89,8 +89,11 @@ class Settings(BaseSettings):
     USE_REDIS_QUEUE: bool = True
     MAX_EVENT_RETRIES: int = 3
 
-    # CORS settings (accepts comma-separated, JSON array string, single URL, or list)
-    BACKEND_CORS_ORIGINS: Union[str, List[str]] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    BACKEND_CORS_ORIGINS: Union[str, List[str]] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://darkrai17.vercel.app"
+    ]
 
     # External APIs (Optional for initial bootstrap, but present in config)
     GITHUB_CLIENT_ID: str = ""

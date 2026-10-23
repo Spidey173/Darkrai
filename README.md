@@ -1,6 +1,6 @@
 # Darkrai - Event-Driven GitHub Automation Platform
 
-### Live Demo: [https://darkrai-one.vercel.app/](https://darkrai-one.vercel.app/)
+### Live Demo: [https://darkrai17.vercel.app/](https://darkrai17.vercel.app/)
 
 Darkrai is an event-driven GitHub automation platform that ingests repository webhooks, evaluates rule-based workflows, and executes automated actions such as issue labeling, contextual comments, security alerts, and Slack notifications. The platform includes a real-time observability dashboard for monitoring event ingestion, queue lifecycle, and rule executions.
 
