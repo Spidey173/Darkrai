@@ -45,14 +45,12 @@ def sanitize_database_url(v: Any) -> str:
 DEV_FALLBACK_SECRET_KEY = "darkrai-dev-secret-key-32bytes-for-development"
 DEV_FALLBACK_ENCRYPTION_KEY = "DgMHhFBzYTgCBS_Y9pSwCl5_ObmQUmD1i528mpYdPTQ="
 INSECURE_SECRET_KEYS = {
-    DEV_FALLBACK_SECRET_KEY,
     "change_me_to_a_secure_random_string",
     "secret",
     "password",
     ""
 }
 INSECURE_ENCRYPTION_KEYS = {
-    DEV_FALLBACK_ENCRYPTION_KEY,
     "change_me_to_32_urlsafe_base64_encoded_bytes=",
     ""
 }
