@@ -18,6 +18,15 @@ from backend.app.core.config import settings
 logger = logging.getLogger("app.api.v1.webhooks")
 router = APIRouter()
 
+# HTTP 413 Payload Too Large status code compatible across all Starlette / FastAPI versions
+try:
+    HTTP_413_PAYLOAD_TOO_LARGE = status.HTTP_413_CONTENT_TOO_LARGE
+except AttributeError:
+    try:
+        HTTP_413_PAYLOAD_TOO_LARGE = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+    except AttributeError:
+        HTTP_413_PAYLOAD_TOO_LARGE = 413
+
 @router.post("/github", status_code=status.HTTP_202_ACCEPTED)
 async def github_webhook_receiver(
     request: Request,
@@ -33,7 +42,7 @@ async def github_webhook_receiver(
         try:
             if int(content_length) > settings.MAX_WEBHOOK_PAYLOAD_BYTES:
                 raise HTTPException(
-                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    status_code=HTTP_413_PAYLOAD_TOO_LARGE,
                     detail=f"Webhook payload exceeds maximum size limit of {settings.MAX_WEBHOOK_PAYLOAD_BYTES} bytes."
                 )
         except ValueError:
@@ -45,7 +54,7 @@ async def github_webhook_receiver(
         total_bytes += len(chunk)
         if total_bytes > settings.MAX_WEBHOOK_PAYLOAD_BYTES:
             raise HTTPException(
-                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                status_code=HTTP_413_PAYLOAD_TOO_LARGE,
                 detail=f"Webhook payload exceeds maximum size limit of {settings.MAX_WEBHOOK_PAYLOAD_BYTES} bytes."
             )
         body_chunks.append(chunk)
