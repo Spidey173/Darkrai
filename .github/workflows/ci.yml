@@ -11,6 +11,7 @@ jobs:
     name: Backend Tests & Quality Checks
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
 
@@ -27,11 +28,14 @@ jobs:
       - name: Install backend dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt pytest pytest-asyncio httpx
+          pip install -r backend/requirements.txt
 
       - name: Run Pytest Suite
+        env:
+          PYTHONPATH: .
+          APP_ENV: testing
         run: |
-          pytest backend/app/tests -v
+          pytest -c pytest.ini backend/app/tests -v
 
   frontend-build:
     name: Frontend Build & Typecheck
