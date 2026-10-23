@@ -1,5 +1,8 @@
+import hashlib
+import hmac
 import logging
 import secrets
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Response, Request, status
@@ -21,10 +24,35 @@ STATE_COOKIE_NAME = "oauth_state"
 SESSION_COOKIE_NAME = "session_token"
 STATE_EXPIRY_SECONDS = 600  # 10 minutes
 
+def generate_oauth_state(secret_key: str) -> str:
+    """Generates an HMAC-signed state token containing a random nonce, timestamp, and signature."""
+    nonce = secrets.token_urlsafe(24)
+    ts = str(int(time.time()))
+    payload = f"{nonce}.{ts}"
+    sig = hmac.new(secret_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return f"{payload}.{sig}"
+
+def verify_oauth_state(state: str, secret_key: str, max_age: int = STATE_EXPIRY_SECONDS) -> bool:
+    """Verifies the HMAC signature and timestamp of an OAuth state token."""
+    try:
+        parts = state.split(".")
+        if len(parts) != 3:
+            return False
+        nonce, ts_str, sig = parts
+        ts = int(ts_str)
+        now = int(time.time())
+        if ts > now + 60 or (now - ts) > max_age:
+            return False
+        payload = f"{nonce}.{ts_str}"
+        expected_sig = hmac.new(secret_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+        return hmac.compare_digest(sig, expected_sig)
+    except Exception:
+        return False
+
 @router.get("/github/login")
 async def github_login() -> RedirectResponse:
     """Redirects the client browser to GitHub's OAuth authorization page."""
-    state = secrets.token_urlsafe(32)
+    state = generate_oauth_state(settings.SECRET_KEY)
     
     scopes = "repo read:user user:email"
     github_url = (
@@ -80,10 +108,18 @@ async def github_callback(
             detail="Missing code or state parameters."
         )
 
-    # 2. Verify state token matching
+    # 2. Verify state token matching (dual layer: matching cookie OR valid HMAC signature)
     cookie_state = request.cookies.get(STATE_COOKIE_NAME)
-    if not cookie_state or cookie_state != state:
-        logger.warning("OAuth state verification failed. Cookie present: %s, match: %s", bool(cookie_state), cookie_state == state)
+    cookie_valid = bool(cookie_state and cookie_state == state)
+    hmac_valid = verify_oauth_state(state, settings.SECRET_KEY, max_age=STATE_EXPIRY_SECONDS)
+
+    if not cookie_valid and not hmac_valid:
+        logger.warning(
+            "OAuth state verification failed. Cookie present: %s, match: %s, HMAC valid: %s",
+            bool(cookie_state),
+            cookie_state == state if cookie_state else False,
+            hmac_valid
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
