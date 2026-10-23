@@ -1,19 +1,4 @@
 import './globals.css';
-import { Inter, Syne } from 'next/font/google';
-
-const inter = Inter({
-  subsets: ['latin'],
-  weight: ['300', '400', '500', '600', '700'],
-  variable: '--font-inter',
-  display: 'swap',
-});
-
-const syne = Syne({
-  subsets: ['latin'],
-  weight: ['500', '600', '700', '800'],
-  variable: '--font-syne',
-  display: 'swap',
-});
 
 export const metadata = {
   title: 'Darkrai — GitHub Automation',
@@ -27,8 +12,9 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className={`${inter.variable} ${syne.variable}`}>
+    <html lang="en">
       <body>{children}</body>
     </html>
   );
 }
+

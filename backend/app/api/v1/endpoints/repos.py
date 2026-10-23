@@ -8,7 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.api.deps import get_db, get_current_user
 from backend.app.models.user import User
 from backend.app.models.repository import Repository
-from backend.app.schemas.repository import RepositoryConnect, RepositoryResponse, GitHubRepoResponse
+from backend.app.schemas.repository import (
+    RepositoryConnect,
+    RepositoryResponse,
+    RepositorySlackWebhookUpdate,
+    GitHubRepoResponse,
+)
 from backend.app.services.encryption import encrypt_token, decrypt_token
 from backend.app.services.github_client import GitHubClient
 
@@ -51,14 +56,7 @@ async def list_connected_repositories(
     result = await db.execute(
         select(Repository).where(Repository.user_id == current_user.id)
     )
-    repos = result.scalars().all()
-    
-    # Decrypt slack webhooks for representation if desired
-    for repo in repos:
-        if repo.slack_webhook_url_encrypted:
-            repo.slack_webhook_url = decrypt_token(repo.slack_webhook_url_encrypted)
-            
-    return repos
+    return list(result.scalars().all())
 
 @router.post("/connect", response_model=RepositoryResponse, status_code=status.HTTP_201_CREATED)
 async def connect_repository(
@@ -79,8 +77,8 @@ async def connect_repository(
 
     # 2. Encrypt Slack Webhook if provided
     encrypted_slack_url = None
-    if payload.slack_webhook_url:
-        encrypted_slack_url = encrypt_token(payload.slack_webhook_url)
+    if payload.slack_webhook_url and payload.slack_webhook_url.strip():
+        encrypted_slack_url = encrypt_token(payload.slack_webhook_url.strip())
 
     # 3. Generate random webhook signing secret
     webhook_secret = secrets.token_hex(20)
@@ -100,11 +98,31 @@ async def connect_repository(
     db.add(new_repo)
     await db.commit()
     await db.refresh(new_repo)
-
-    if new_repo.slack_webhook_url_encrypted:
-        new_repo.slack_webhook_url = decrypt_token(new_repo.slack_webhook_url_encrypted)
-        
     return new_repo
+
+@router.patch("/{id}/slack-webhook", response_model=RepositoryResponse)
+async def update_repository_slack_webhook(
+    id: UUID,
+    payload: RepositorySlackWebhookUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+) -> Repository:
+    """Safely configure, rotate, or clear repository Slack webhook credential."""
+    result = await db.execute(
+        select(Repository).where(Repository.id == id, Repository.user_id == current_user.id)
+    )
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repository not found.")
+
+    if payload.slack_webhook_url and payload.slack_webhook_url.strip():
+        repo.slack_webhook_url_encrypted = encrypt_token(payload.slack_webhook_url.strip())
+    else:
+        repo.slack_webhook_url_encrypted = None
+
+    await db.commit()
+    await db.refresh(repo)
+    return repo
 
 @router.post("/{id}/enable", response_model=RepositoryResponse)
 async def enable_repository_bot(
@@ -136,9 +154,6 @@ async def enable_repository_bot(
         repo.is_active = True
         await db.commit()
         await db.refresh(repo)
-        
-        if repo.slack_webhook_url_encrypted:
-            repo.slack_webhook_url = decrypt_token(repo.slack_webhook_url_encrypted)
         return repo
 
     except Exception as e:
@@ -178,9 +193,6 @@ async def disable_repository_bot(
         repo.is_active = False
         await db.commit()
         await db.refresh(repo)
-
-        if repo.slack_webhook_url_encrypted:
-            repo.slack_webhook_url = decrypt_token(repo.slack_webhook_url_encrypted)
         return repo
 
     except Exception as e:

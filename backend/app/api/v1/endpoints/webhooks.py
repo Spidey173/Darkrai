@@ -27,20 +27,57 @@ async def github_webhook_receiver(
     x_hub_signature_256: str = Header(...),
     db: AsyncSession = Depends(get_db)
 ) -> dict:
+    # 1. Enforce payload size limits before or during body read
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > settings.MAX_WEBHOOK_PAYLOAD_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail=f"Webhook payload exceeds maximum size limit of {settings.MAX_WEBHOOK_PAYLOAD_BYTES} bytes."
+                )
+        except ValueError:
+            pass
+
     body = await request.body()
+    if len(body) > settings.MAX_WEBHOOK_PAYLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"Webhook payload exceeds maximum size limit of {settings.MAX_WEBHOOK_PAYLOAD_BYTES} bytes."
+        )
+
+    # 2. Validate header presence and non-empty values
+    if not x_github_event.strip() or not x_github_delivery.strip() or not x_hub_signature_256.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing required GitHub webhook headers."
+        )
+
+    # 3. Parse and validate JSON structure
     try:
         payload = json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed JSON payload.")
 
-    repo_name = payload.get("repository", {}).get("full_name")
-    if not repo_name:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON: expected an object.")
+
+    repo_data = payload.get("repository")
+    if not isinstance(repo_data, dict):
         logger.warning("Received webhook event '%s' missing repository metadata.", x_github_delivery)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, 
             detail="Missing repository metadata in payload."
         )
 
+    repo_name = repo_data.get("full_name")
+    if not repo_name or not isinstance(repo_name, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing repository full_name in payload."
+        )
+
+    # 4. Resolve connected repository record
     result = await db.execute(
         select(Repository)
         .options(joinedload(Repository.user), selectinload(Repository.rules))
@@ -54,6 +91,7 @@ async def github_webhook_receiver(
             detail="Repository not connected to database."
         )
 
+    # 5. Raw body HMAC signature verification
     webhook_secret = decrypt_token(repo.webhook_secret_encrypted)
     if not verify_signature(body, x_hub_signature_256, webhook_secret):
         logger.warning("Webhook signature verification failed for repo: %s", repo_name)
@@ -61,12 +99,13 @@ async def github_webhook_receiver(
             "delivery_id": x_github_delivery,
             "repo": repo_name,
             "event_type": x_github_event
-        }, level="WARNING")
+        }, level="WARNING", user_id=str(repo.user_id))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, 
             detail="HMAC signature verification failed."
         )
 
+    # 6. Delivery deduplication
     try:
         parsed_delivery_id = _uuid_module.UUID(x_github_delivery)
     except Exception:
@@ -83,6 +122,7 @@ async def github_webhook_receiver(
 
     action = payload.get("action")
 
+    # 7. Persist event BEFORE acknowledgement
     new_event = WebhookEvent(
         repository_id=repo.id,
         delivery_id=parsed_delivery_id,
@@ -102,37 +142,42 @@ async def github_webhook_receiver(
         "event_type": x_github_event,
         "action": action,
         "repository": repo_name
-    })
+    }, user_id=str(repo.user_id))
 
+    # 8. Dispatch processing: eliminate dual execution
     if x_github_event in ("issues", "pull_request"):
-        await event_queue.enqueue(
-            event_id=str(new_event.id),
-            delivery_id=str(x_github_delivery),
-            payload_summary={
-                "event_type": x_github_event,
-                "action": action,
-                "repo": repo_name
-            }
-        )
-        # Always execute inline to ensure serverless runtimes (e.g. Vercel) and 
-        # single-container deployments execute automation rules reliably before the response cycle ends.
-        from backend.app.services.event_processor import process_webhook_event
-        try:
-            await process_webhook_event(
+        if settings.EXECUTE_INLINE:
+            # Inline execution (e.g. serverless Vercel function)
+            from backend.app.services.event_processor import process_webhook_event
+            try:
+                await process_webhook_event(
+                    event_id=str(new_event.id),
+                    db=db,
+                    event=new_event,
+                    repository=repo,
+                    owner_user=repo.user
+                )
+            except Exception as proc_err:
+                logger.error("Failed processing event inline: %s", proc_err, exc_info=True)
+            queue_backend = "inline"
+        else:
+            # Asynchronous background worker execution
+            await event_queue.enqueue(
                 event_id=str(new_event.id),
-                db=db,
-                event=new_event,
-                repository=repo,
-                owner_user=repo.user
+                delivery_id=str(x_github_delivery),
+                payload_summary={
+                    "event_type": x_github_event,
+                    "action": action,
+                    "repo": repo_name
+                }
             )
-        except Exception as proc_err:
-            logger.error("Failed processing event inline: %s", proc_err, exc_info=True)
+            queue_backend = event_queue.metrics["backend"]
 
         return {
-            "detail": "Webhook event accepted and queued for processing.",
+            "detail": "Webhook event accepted for processing.",
             "event_id": str(new_event.id),
             "delivery_id": str(x_github_delivery),
-            "queue_backend": event_queue.metrics["backend"]
+            "queue_backend": queue_backend
         }
     else:
         new_event.status = "completed"

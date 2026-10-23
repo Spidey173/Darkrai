@@ -2,12 +2,12 @@ import asyncio
 import json
 import logging
 from typing import List, Dict, Any
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from backend.app.api.deps import get_db, get_current_user
+from backend.app.api.deps import get_db, get_current_user, get_current_user_ws
 from backend.app.models.user import User
 from backend.app.models.event import WebhookEvent
 from backend.app.models.action_log import ActionLog
@@ -129,17 +129,26 @@ async def get_recent_events(
     return {"events": serialized_events, "total": total}
 
 @router.get("/queue")
-async def get_queue_telemetry() -> Dict[str, Any]:
+async def get_queue_telemetry(
+    current_user: User = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Returns queue processing statistics for the authenticated operator."""
     return await event_queue.get_queue_stats()
 
 @router.get("/logs")
-async def get_recent_stream_logs() -> List[Dict[str, Any]]:
-    return stream_broker.get_recent_events()
+async def get_recent_stream_logs(
+    current_user: User = Depends(get_current_user)
+) -> List[Dict[str, Any]]:
+    """Returns recent stream logs scoped to the authenticated user."""
+    return stream_broker.get_recent_events(user_id=str(current_user.id))
 
 @router.get("/stream")
-async def sse_event_stream():
+async def sse_event_stream(
+    current_user: User = Depends(get_current_user)
+):
+    """Authenticated SSE stream emitting user-tenant event activity."""
     async def event_generator():
-        q = await stream_broker.register_sse_subscriber()
+        q = await stream_broker.register_sse_subscriber(user_id=str(current_user.id))
         try:
             while True:
                 try:
@@ -164,8 +173,16 @@ async def sse_event_stream():
 
 @router.websocket("/ws")
 async def websocket_event_stream(websocket: WebSocket):
+    """Authenticated WebSocket stream restricted to the authenticated user."""
+    try:
+        user = await get_current_user_ws(websocket)
+    except Exception as auth_err:
+        logger.warning("WebSocket authentication failed: %s", auth_err)
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     await websocket.accept()
-    await stream_broker.register_websocket(websocket)
+    await stream_broker.register_websocket(websocket, user_id=str(user.id))
     try:
         while True:
             data = await websocket.receive_text()
@@ -176,3 +193,4 @@ async def websocket_event_stream(websocket: WebSocket):
     except Exception as exc:
         logger.debug("WebSocket terminated: %s", exc)
         await stream_broker.unregister_websocket(websocket)
+

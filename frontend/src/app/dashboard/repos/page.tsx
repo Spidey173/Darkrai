@@ -21,7 +21,8 @@ interface ConnectedRepo {
   full_name: string;
   is_active: boolean;
   webhook_id: number | null;
-  slack_webhook_url: string | null;
+  has_slack_webhook?: boolean;
+  slack_webhook_url?: string | null;
 }
 
 interface GitHubRepoOption {
@@ -270,7 +271,7 @@ export default function ReposPage() {
                     {repo.name}
                   </h2>
                   <p className={styles.repoOwner}>{repo.owner}</p>
-                  {repo.slack_webhook_url && (
+                  {(repo.has_slack_webhook || repo.slack_webhook_url) && (
                     <span className={styles.slackBadge} aria-label="Slack connected">
                       <Link2 size={11} aria-hidden="true" />
                       Slack

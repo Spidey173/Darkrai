@@ -11,6 +11,7 @@ except ImportError:
     aioredis = None
 
 from backend.app.core.config import settings
+from backend.app.core.logging import sanitize_url
 from backend.app.services.event_stream import stream_broker
 
 logger = logging.getLogger("app.services.queue")
@@ -68,12 +69,12 @@ class EventQueue:
             await client.ping()
             self._redis = client
             self._is_redis_available = True
-            self.metrics["backend"] = "redis"
-            logger.info("Connected to Redis successfully at %s", settings.REDIS_URL)
+            safe_redis_url = sanitize_url(settings.REDIS_URL)
+            logger.info("Connected to Redis successfully at %s", safe_redis_url)
             await stream_broker.broadcast("queue:status", {
                 "status": "connected",
                 "backend": "redis",
-                "url": settings.REDIS_URL
+                "url": safe_redis_url
             })
             return True
         except Exception as exc:

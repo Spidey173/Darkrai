@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator
-from fastapi import Request, HTTPException, Depends, status
+from uuid import UUID
+from fastapi import Request, WebSocket, HTTPException, Depends, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.db.session import get_async_session, async_session_maker
@@ -11,9 +12,17 @@ get_db = get_async_session
 
 async def get_current_user(
     request: Request,
+    db: AsyncSession = Depends(get_db)
 ) -> User:
-    """Dependency validating the session cookie JWT and fetching the active User from Postgres."""
+    """Dependency validating the session JWT from cookie, Authorization header, or query param, and fetching the active User."""
     session_token = request.cookies.get("session_token")
+    if not session_token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            session_token = auth_header[7:].strip()
+    if not session_token:
+        session_token = request.query_params.get("token")
+
     if not session_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -26,13 +35,60 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session token invalid or expired."
         )
+
+    try:
+        parsed_user_id = UUID(str(user_id))
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session token invalid: malformed user identifier."
+        )
+        
+    result = await db.execute(select(User).where(User.id == parsed_user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User session valid, but record not found."
+        )
+    return user
+
+async def get_current_user_ws(
+    websocket: WebSocket,
+) -> User:
+    """Authenticates a WebSocket connection using cookie or token query parameter."""
+    session_token = websocket.cookies.get("session_token")
+    if not session_token:
+        session_token = websocket.query_params.get("token")
+        
+    if not session_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated. Session token missing."
+        )
+        
+    user_id = decode_session_token(session_token)
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session token invalid or expired."
+        )
+
+    try:
+        parsed_user_id = UUID(str(user_id))
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session token invalid: malformed user identifier."
+        )
         
     async with async_session_maker() as db:
-        result = await db.execute(select(User).where(User.id == user_id))
+        result = await db.execute(select(User).where(User.id == parsed_user_id))
         user = result.scalar_one_or_none()
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User session valid, but record not found."
+                detail="User not found."
             )
         return user
+

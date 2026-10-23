@@ -22,7 +22,7 @@ from fastapi.exceptions import RequestValidationError
 from contextlib import asynccontextmanager
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from backend.app.core.config import settings
-from backend.app.core.logging import setup_logging
+from backend.app.core.logging import setup_logging, sanitize_url
 from backend.app.middleware.logging_middleware import LoggingMiddleware
 from backend.app.api.v1.router import api_router
 from backend.app.models.base import Base
@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
         try:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
-            logger.info("Database schema verified for %s", settings.DATABASE_URL)
+            logger.info("Database schema verified for %s", sanitize_url(settings.DATABASE_URL))
         except Exception as e:
             logger.warning("Could not auto-create tables: %s", e)
 

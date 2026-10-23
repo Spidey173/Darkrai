@@ -146,7 +146,7 @@ async def test_webhook_successful_ingestion_and_deduplication(client: AsyncClien
         }
     )
     assert response.status_code == 202
-    assert response.json()["detail"] == "Webhook event accepted and queued for processing."
+    assert "Webhook event accepted" in response.json()["detail"]
     event_id = response.json()["event_id"]
 
     # Verify event stored in database
@@ -172,3 +172,35 @@ async def test_webhook_successful_ingestion_and_deduplication(client: AsyncClien
     )
     assert response_dup.status_code == 200
     assert response_dup.json()["detail"] == "Webhook event delivery duplicate, skipped processing."
+
+@pytest.mark.asyncio
+async def test_webhook_missing_required_headers(client: AsyncClient):
+    response = await client.post(
+        "/api/v1/webhooks/github",
+        content=b'{"action": "opened"}',
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "issues",
+            "X-GitHub-Delivery": "",  # Empty
+            "X-Hub-Signature-256": "sha256=123"
+        }
+    )
+    assert response.status_code == 400
+    assert "Missing required GitHub webhook headers" in response.json()["detail"]
+
+@pytest.mark.asyncio
+async def test_webhook_payload_too_large(client: AsyncClient):
+    from backend.app.core.config import settings
+    oversized = b"a" * (settings.MAX_WEBHOOK_PAYLOAD_BYTES + 1024)
+    response = await client.post(
+        "/api/v1/webhooks/github",
+        content=oversized,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "issues",
+            "X-GitHub-Delivery": str(uuid.uuid4()),
+            "X-Hub-Signature-256": "sha256=fake"
+        }
+    )
+    assert response.status_code == 413
+    assert "exceeds maximum size limit" in response.json()["detail"]

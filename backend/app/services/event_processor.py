@@ -1,9 +1,11 @@
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
+from uuid import UUID
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 
+from backend.app.core.config import settings
 from backend.app.db.session import async_session_maker
 from backend.app.models.event import WebhookEvent
 from backend.app.models.repository import Repository
@@ -39,51 +41,75 @@ async def _process_core(
     repository: Optional[Repository],
     owner_user: Optional[User]
 ) -> None:
-    if event is None:
-        result = await db.execute(select(WebhookEvent).where(WebhookEvent.id == event_id))
-        event = result.scalar_one_or_none()
-        
+    try:
+        parsed_id = event_id if isinstance(event_id, UUID) else UUID(str(event_id))
+    except Exception:
+        logger.error("Invalid event_id format: %s", event_id)
+        return
+
+    # Atomic DB event claiming: only transition from 'pending' or 'retrying' to 'processing'
+    claim_stmt = (
+        update(WebhookEvent)
+        .where(
+            WebhookEvent.id == parsed_id,
+            WebhookEvent.status.in_(["pending", "retrying"])
+        )
+        .values(
+            status="processing",
+            updated_at=datetime.now(timezone.utc)
+        )
+    )
+    claim_res = await db.execute(claim_stmt)
+    await db.commit()
+
+    if claim_res.rowcount == 0:
+        chk_res = await db.execute(select(WebhookEvent).where(WebhookEvent.id == parsed_id))
+        existing_evt = chk_res.scalar_one_or_none()
+        st = existing_evt.status if existing_evt else "missing"
+        logger.info("Webhook event '%s' not claimable (current status: '%s'). Skipping duplicate/concurrent execution.", parsed_id, st)
+        return
+
+    # Fetch freshly claimed event
+    result = await db.execute(select(WebhookEvent).where(WebhookEvent.id == parsed_id))
+    event = result.scalar_one_or_none()
     if not event:
-        logger.error("Webhook event '%s' not found.", event_id)
+        logger.error("Webhook event '%s' not found after claiming.", parsed_id)
         return
 
-    if event.status in ("completed", "processing"):
-        logger.info("Webhook event '%s' is already '%s'. Skipping.", event_id, event.status)
-        return
+    # Resolve target repository and owner user to scope telemetry broadcasts
+    if repository is None:
+        repo_result = await db.execute(
+            select(Repository).where(Repository.id == event.repository_id)
+        )
+        repository = repo_result.scalar_one_or_none()
+    if not repository:
+        raise ValueError("Associated repository details not found.")
 
-    event.status = "processing"
+    if owner_user is None:
+        if hasattr(repository, "user") and repository.user is not None:
+            owner_user = repository.user
+        else:
+            user_result = await db.execute(select(User).where(User.id == repository.user_id))
+            owner_user = user_result.scalar_one_or_none()
+    if not owner_user:
+        raise ValueError("Repository owner credential record missing.")
+
+    target_user_id = str(owner_user.id)
 
     await stream_broker.broadcast("event:processing_started", {
         "event_id": str(event.id),
         "event_type": event.event_type,
         "action": event.action,
         "delivery_id": str(event.delivery_id)
-    })
+    }, user_id=target_user_id)
 
     try:
-        if repository is None:
-            repo_result = await db.execute(
-                select(Repository).where(Repository.id == event.repository_id)
-            )
-            repository = repo_result.scalar_one_or_none()
-        if not repository:
-            raise ValueError("Associated repository details not found.")
-
         if not repository.is_active:
             logger.warning("Repository '%s' is inactive. Skipping action execution.", repository.full_name)
             event.status = "completed"
             event.processed_at = datetime.now(timezone.utc)
             await db.commit()
             return
-
-        if owner_user is None:
-            if hasattr(repository, "user") and repository.user is not None:
-                owner_user = repository.user
-            else:
-                user_result = await db.execute(select(User).where(User.id == repository.user_id))
-                owner_user = user_result.scalar_one_or_none()
-        if not owner_user:
-            raise ValueError("Repository owner credential record missing.")
 
         github_token = decrypt_token(owner_user.github_access_token_encrypted)
 
@@ -149,7 +175,7 @@ async def _process_core(
                     "rule_id": str(rule.id),
                     "rule_name": rule.name,
                     "event_id": str(event.id)
-                })
+                }, user_id=target_user_id)
 
                 for action in rule.actions:
                     action_type = action.get("type")
@@ -220,7 +246,7 @@ async def _process_core(
                                 "is_safe": scan_report.is_safe,
                                 "risk_score": scan_report.risk_score,
                                 "findings": scan_report.total_findings
-                            }, level="INFO" if scan_report.is_safe else "WARNING")
+                            }, level="INFO" if scan_report.is_safe else "WARNING", user_id=target_user_id)
 
                         elif action_type == "ai_pr_review":
                             code_to_review = diff_text or body_text or ""
@@ -256,7 +282,7 @@ async def _process_core(
                                 "event_id": str(event.id),
                                 "provider": review_result["provider"],
                                 "labels": review_result["suggested_labels"]
-                            })
+                            }, user_id=target_user_id)
 
                         elif action_type == "auto_label_semantic":
                             code_sample = diff_text or body_text or ""
@@ -277,7 +303,7 @@ async def _process_core(
                             await stream_broker.broadcast("labels:applied", {
                                 "event_id": str(event.id),
                                 "labels": labels
-                            })
+                            }, user_id=target_user_id)
 
                         else:
                             raise ValueError(f"Unsupported action action_type: {action_type}")
@@ -301,7 +327,7 @@ async def _process_core(
                         "action_type": action_type,
                         "status": status_str,
                         "rule_name": rule.name
-                    }, level="INFO" if status_str == "success" else "ERROR")
+                    }, level="INFO" if status_str == "success" else "ERROR", user_id=target_user_id)
 
         event.status = "completed"
         event.processed_at = datetime.now(timezone.utc)
@@ -309,12 +335,18 @@ async def _process_core(
 
     except Exception as err:
         logger.error("Event processing crash on event '%s': %s", event_id, str(err), exc_info=True)
-        event.status = "failed"
+        event.retry_count = (event.retry_count or 0) + 1
+        if event.retry_count < settings.MAX_EVENT_RETRIES:
+            event.status = "retrying"
+        else:
+            event.status = "failed"
         event.error_message = str(err)
         await stream_broker.broadcast("event:failed", {
             "event_id": str(event_id),
+            "status": event.status,
+            "retry_count": event.retry_count,
             "error": str(err)
-        }, level="ERROR")
+        }, level="ERROR", user_id=target_user_id)
         raise
 
     finally:
@@ -322,4 +354,4 @@ async def _process_core(
         await stream_broker.broadcast("event:completed", {
             "event_id": str(event_id),
             "status": event.status
-        })
+        }, user_id=target_user_id)

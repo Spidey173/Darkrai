@@ -23,9 +23,14 @@ class RepositoryResponse(BaseModel):
     full_name: str
     is_active: bool
     webhook_id: Optional[int] = None
+    has_slack_webhook: bool = False
     slack_webhook_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+class RepositorySlackWebhookUpdate(BaseModel):
+    """Payload to safely update, rotate, or clear repository Slack webhook credential."""
+    slack_webhook_url: Optional[str] = None
 
 class GitHubRepoResponse(BaseModel):
     """Schema representing repository options fetched directly from GitHub API."""
@@ -35,3 +40,4 @@ class GitHubRepoResponse(BaseModel):
     full_name: str
     description: Optional[str] = None
     private: bool
+

@@ -1,6 +1,25 @@
 import logging.config
 import sys
+from urllib.parse import urlsplit, urlunsplit
 from backend.app.core.config import settings
+
+def sanitize_url(url: str) -> str:
+    """Masks sensitive credentials (username/password) in database or cache URLs for safe logging."""
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        if not parts.netloc or "@" not in parts.netloc:
+            return url
+        user_info, host_info = parts.netloc.split("@", 1)
+        if ":" in user_info:
+            username, _ = user_info.split(":", 1)
+            safe_netloc = f"{username}:***@{host_info}"
+        else:
+            safe_netloc = f"***@{host_info}"
+        return urlunsplit((parts.scheme, safe_netloc, parts.path, parts.query, parts.fragment))
+    except Exception:
+        return "[sanitized-url]"
 
 def setup_logging() -> None:
     """Configures structured application logging."""

@@ -26,6 +26,10 @@ class Repository(Base, TimestampMixin):
     webhook_secret_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     slack_webhook_url_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    @property
+    def has_slack_webhook(self) -> bool:
+        return bool(self.slack_webhook_url_encrypted)
+
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="repositories")
     rules: Mapped[List["Rule"]] = relationship(
@@ -34,3 +38,4 @@ class Repository(Base, TimestampMixin):
     webhook_events: Mapped[List["WebhookEvent"]] = relationship(
         "WebhookEvent", back_populates="repository", cascade="all, delete"
     )
+
