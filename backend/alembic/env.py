@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 # Import Base metadata and configuration settings
 from backend.app.core.config import settings
-from backend.app.models.base import Base
+from backend.app.models import Base
 
 # Alembic configuration object
 config = context.config

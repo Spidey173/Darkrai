@@ -87,15 +87,26 @@ maxmemory-policy noeviction  # Never evict queue keys silently
 
 ---
 
-## 4. Action Idempotency & Reconciliation
+## 4. Action Idempotency & External Crash Reconciliation
 
-To prevent duplicate side effects (e.g. duplicate GitHub PR comments or duplicate Slack notifications) when workers crash midway through processing:
+To prevent duplicate side effects (e.g. duplicate GitHub PR comments or duplicate Slack notifications) when workers crash midway through processing or immediately after external APIs accept an action:
 
-1. Every action computes a deterministic SHA-256 fingerprint:
-   `idempotency_key = sha256(f"{event.id}:{rule.id}:{action_type}:{action_value}")`
-2. Before invoking GitHub or Slack APIs, the worker queries `action_logs` for an existing `success` record with that key.
-3. If previously completed, the external API call is skipped and reconciled.
-4. Each executed action is committed immediately upon completion.
+1. **Deterministic Fingerprinting**:
+   Every action computes a deterministic SHA-256 fingerprint:
+   `idempotency_key = sha256(f"{event.id}:{rule.id}:{action_type}:{action_val_repr}")`
+2. **Phase 1 (Write-Ahead Intent Reservation)**:
+   Before invoking GitHub or Slack APIs, the worker writes an `action_logs` record with `status="in_progress"` and commits it to the database.
+3. **Deterministic External Tracking Marker**:
+   When posting GitHub comments, Darkrai appends an invisible HTML tracking marker:
+   `\n\n<!-- darkrai-idempotency:{idempotency_key} -->`
+4. **Phase 2 (External State Reconciliation on Crash Recovery)**:
+   If a worker crashes after the external service accepts an action but before the success log is saved:
+   - On retry/recovery, the recovering worker detects `status == "in_progress"`.
+   - The worker queries the external service (`list_issue_comments` for the tracking tag, or `list_issue_labels` for the target label).
+   - If the action already exists on GitHub, the worker reconciles `action_logs.status = "success"` (`reconciled_after_crash = True`) and skips invoking the external API, preventing duplicate side effects.
+   - If the action is not yet present on GitHub, the worker proceeds with dispatch.
+5. **Terminal Confirmation**:
+   Upon successful dispatch, `action_logs.status` is updated to `"success"` and committed immediately.
 
 ---
 

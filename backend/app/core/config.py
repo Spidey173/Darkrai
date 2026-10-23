@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "Darkrai"
     APP_ENV: str = "development"
     DEBUG: bool = True
+    TESTING: bool = False
 
     # Security Config (defaults resolved safely in model_validator based on APP_ENV)
     SECRET_KEY: str = ""

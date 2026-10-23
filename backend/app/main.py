@@ -37,7 +37,8 @@ logger = logging.getLogger("app.main")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize SQLite database schema automatically for zero-config local runs
-    if "sqlite" in settings.DATABASE_URL and not settings.TESTING:
+    is_testing = settings.TESTING or settings.APP_ENV in ("test", "testing")
+    if "sqlite" in settings.DATABASE_URL and not is_testing:
         try:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
