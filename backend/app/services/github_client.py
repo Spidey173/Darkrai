@@ -152,3 +152,31 @@ class GitHubClient:
                 return response.text
             logger.warning("Failed to fetch PR diff: %s - status %d", response.text, response.status_code)
             return ""
+
+    @classmethod
+    async def list_issue_comments(
+        cls, access_token: str, owner: str, repo: str, issue_number: int
+    ) -> List[Dict[str, Any]]:
+        """Lists comments on an issue or pull request for idempotency reconciliation."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=cls._headers(access_token))
+            if response.status_code == 200:
+                return response.json()
+            logger.warning("Failed to list comments: %s (status %d)", response.text, response.status_code)
+            return []
+
+    @classmethod
+    async def list_issue_labels(
+        cls, access_token: str, owner: str, repo: str, issue_number: int
+    ) -> List[str]:
+        """Lists existing label names on an issue or pull request for idempotency reconciliation."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/labels"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=cls._headers(access_token))
+            if response.status_code == 200:
+                labels_data = response.json()
+                return [l.get("name", "") if isinstance(l, dict) else str(l) for l in labels_data]
+            logger.warning("Failed to list labels: %s (status %d)", response.text, response.status_code)
+            return []
+

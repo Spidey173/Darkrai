@@ -71,7 +71,7 @@ Darkrai is an event-driven GitHub automation platform that ingests repository we
 - Python AST (`ast`) Static Security Engine
 - AI PR Review Engine (Google Gemini / OpenAI / Heuristic)
 - SQLAlchemy 2.0 Async (PostgreSQL + aiosqlite fallback)
-- Pytest & Pytest-Asyncio (33 Unit & Integration Tests)
+- Pytest & Pytest-Asyncio (41 Unit & Integration Tests)
 
 ### Infrastructure & CI/CD
 - GitHub Actions CI (`.github/workflows/ci.yml`)
@@ -122,7 +122,7 @@ npm run dev
 ```bash
 pytest backend/app/tests -v
 ```
-> Executes 40 unit and integration tests verifying secret validation fail-fast, webhook HMAC verification and streaming size limits, delivery deduplication, tenant telemetry isolation, AST security audits, AI code review, atomic claiming, explicit worker lease ownership & active renewal, action execution idempotency, cookie CSRF protection, and DLQ replay. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for full production operations and runbook.
+> Executes 41 unit and integration tests verifying secret validation fail-fast, webhook HMAC verification and streaming size limits, delivery deduplication, tenant telemetry isolation, AST security audits, AI code review, atomic claiming, explicit worker lease ownership & active renewal, two-phase action execution idempotency with external side-effect crash reconciliation, cookie CSRF protection, and DLQ replay. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for full production operations and runbook.
 
 ---
 

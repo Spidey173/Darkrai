@@ -246,25 +246,83 @@ async def _process_core(
                     action_type = action.get("type")
                     action_value = action.get("value")
 
-                    # Deterministic action idempotency key
+                    # Deterministic action idempotency key & tracking marker
                     action_val_repr = json.dumps(action_value, sort_keys=True) if isinstance(action_value, (dict, list)) else str(action_value)
                     action_fingerprint = f"{event.id}:{rule.id}:{action_type}:{action_val_repr}"
                     idempotency_key = hashlib.sha256(action_fingerprint.encode("utf-8")).hexdigest()
+                    idempotency_marker = f"<!-- darkrai-idempotency:{idempotency_key} -->"
 
-                    # Deduplication / Reconciliation: Skip side effect if already succeeded
+                    # Check existing action state
                     duplicate_check = await db.execute(
                         select(ActionLog).where(
-                            ActionLog.idempotency_key == idempotency_key,
-                            ActionLog.status == "success"
+                            ActionLog.idempotency_key == idempotency_key
                         )
                     )
                     existing_action = duplicate_check.scalar_one_or_none()
-                    if existing_action:
+
+                    # 1. If already succeeded or reconciled, skip side effects
+                    if existing_action and existing_action.status in ("success", "reconciled"):
                         logger.info(
                             "Action '%s' (key=%s) already successfully executed for event '%s'. Reconciling and skipping side effects.",
                             action_type, idempotency_key[:12], event.id
                         )
                         continue
+
+                    # 2. Crash recovery / reconciliation if previously left in 'in_progress'
+                    # Check whether the external service accepted the action before the previous process crashed.
+                    if existing_action and existing_action.status == "in_progress":
+                        reconciled = False
+                        if action_type in ("create_comment", "ast_security_scan", "ai_pr_review") and number:
+                            try:
+                                existing_comments = await GitHubClient.list_issue_comments(
+                                    github_token, repository.owner, repository.name, number
+                                )
+                                for c in existing_comments:
+                                    if idempotency_marker in (c.get("body") or ""):
+                                        reconciled = True
+                                        logger.info(
+                                            "Reconciled in_progress action '%s' (key=%s): comment with marker already exists on GitHub. Skipping duplicate call.",
+                                            action_type, idempotency_key[:12]
+                                        )
+                                        break
+                            except Exception as rec_err:
+                                logger.warning("External comment reconciliation check failed: %s", rec_err)
+
+                        elif action_type in ("add_label", "auto_label_semantic") and number:
+                            try:
+                                existing_labels = await GitHubClient.list_issue_labels(
+                                    github_token, repository.owner, repository.name, number
+                                )
+                                if action_type == "add_label" and action_value in existing_labels:
+                                    reconciled = True
+                                    logger.info(
+                                        "Reconciled in_progress action '%s' (key=%s): label '%s' already exists on GitHub. Skipping duplicate call.",
+                                        action_type, idempotency_key[:12], action_value
+                                    )
+                            except Exception as rec_err:
+                                logger.warning("External label reconciliation check failed: %s", rec_err)
+
+                        if reconciled:
+                            existing_action.status = "success"
+                            existing_action.details = {**existing_action.details, "reconciled_after_crash": True}
+                            await db.commit()
+                            continue
+
+                    # 3. Two-phase reservation: Persist intent with status 'in_progress' BEFORE dispatching to external service
+                    if not existing_action:
+                        action_log = ActionLog(
+                            webhook_event_id=event.id,
+                            rule_id=rule.id,
+                            action_type=action_type,
+                            idempotency_key=idempotency_key,
+                            status="in_progress",
+                            details={"attempt": 1}
+                        )
+                        db.add(action_log)
+                        await db.commit()
+                        await db.refresh(action_log)
+                    else:
+                        action_log = existing_action
 
                     status_str = "success"
                     details: Dict[str, Any] = {}
@@ -277,8 +335,10 @@ async def _process_core(
                             details = {"label": action_value, "response": res}
 
                         elif action_type == "create_comment" and number:
+                            # Attach idempotency tracking marker for crash-proof external reconciliation
+                            comment_with_marker = f"{action_value}\n\n{idempotency_marker}"
                             res = await GitHubClient.add_comment_to_issue(
-                                github_token, repository.owner, repository.name, number, action_value
+                                github_token, repository.owner, repository.name, number, comment_with_marker
                             )
                             details = {"comment": action_value, "response": res}
 
@@ -305,7 +365,7 @@ async def _process_core(
                             details = scan_report.to_dict()
 
                             if not scan_report.is_safe and number:
-                                warning_md = scan_report.generate_markdown_summary()
+                                warning_md = f"{scan_report.generate_markdown_summary()}\n\n{idempotency_marker}"
                                 try:
                                     await GitHubClient.add_comment_to_issue(
                                         github_token, repository.owner, repository.name, number, warning_md
@@ -339,9 +399,10 @@ async def _process_core(
 
                             if number:
                                 try:
+                                    review_comment_with_marker = f"{review_result['review_comment']}\n\n{idempotency_marker}"
                                     await GitHubClient.add_comment_to_issue(
                                         github_token, repository.owner, repository.name, number,
-                                        review_result["review_comment"]
+                                        review_comment_with_marker
                                     )
                                     for lbl in review_result["suggested_labels"]:
                                         try:
@@ -388,16 +449,9 @@ async def _process_core(
                         status_str = "failed"
                         details = {"error": str(action_err)}
 
-                    # Persist action state immediately so crashes/retries do not duplicate completed side effects
-                    action_log = ActionLog(
-                        webhook_event_id=event.id,
-                        rule_id=rule.id,
-                        action_type=action_type,
-                        idempotency_key=idempotency_key,
-                        status=status_str,
-                        details=details
-                    )
-                    db.add(action_log)
+                    # Update action state to terminal status (success or failed) and commit immediately
+                    action_log.status = status_str
+                    action_log.details = details
                     await db.commit()
 
                     await stream_broker.broadcast("action:dispatched", {

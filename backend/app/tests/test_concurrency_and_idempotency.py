@@ -396,3 +396,121 @@ async def test_queue_stats_and_alerts_telemetry(client: AsyncClient, db_session:
     assert "p95_latency_ms" in telemetry
     assert "alerts" in telemetry
     assert isinstance(telemetry["alerts"], list)
+
+
+@pytest.mark.asyncio
+async def test_action_idempotency_reconciles_crash_before_success_log(db_session: AsyncSession):
+    """
+    Verifies the distributed crash scenario:
+    An external service (GitHub) accepts an action (e.g. comment or label), but the worker
+    crashes before saving the success log (leaving ActionLog status as 'in_progress').
+    Upon retry/recovery, Darkrai reconciles against the external service via deterministic
+    idempotency markers and prevents duplicate comments/labels.
+    """
+    user = User(
+        github_user_id=191919,
+        github_username="crash_user",
+        github_access_token_encrypted=encrypt_token("gh_token_crash")
+    )
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    repo = Repository(
+        user_id=user.id,
+        github_repo_id=454545,
+        name="crash-repo",
+        owner="crash_user",
+        full_name="crash_user/crash-repo",
+        is_active=True
+    )
+    db_session.add(repo)
+    await db_session.commit()
+    await db_session.refresh(repo)
+
+    rule = Rule(
+        repository_id=repo.id,
+        name="Crash Recovery Rule",
+        event_type="issues",
+        conditions={"field": "issue.title", "operator": "contains", "value": "Crash"},
+        actions=[
+            {"type": "create_comment", "value": "Crash recovery verification"},
+            {"type": "add_label", "value": "recovered"}
+        ],
+        is_active=True
+    )
+    db_session.add(rule)
+    await db_session.commit()
+    await db_session.refresh(rule)
+
+    event = WebhookEvent(
+        repository_id=repo.id,
+        delivery_id=uuid.uuid4(),
+        event_type="issues",
+        action="opened",
+        payload={"issue": {"number": 99, "title": "Crash Scenario Test", "body": "Testing"}},
+        status="pending"
+    )
+    db_session.add(event)
+    await db_session.commit()
+    await db_session.refresh(event)
+
+    # Compute idempotency key for comment
+    comment_val_repr = str("Crash recovery verification")
+    comment_fp = f"{event.id}:{rule.id}:create_comment:{comment_val_repr}"
+    comment_idemp_key = hashlib.sha256(comment_fp.encode("utf-8")).hexdigest()
+    comment_marker = f"<!-- darkrai-idempotency:{comment_idemp_key} -->"
+
+    # Compute idempotency key for label
+    label_val_repr = str("recovered")
+    label_fp = f"{event.id}:{rule.id}:add_label:{label_val_repr}"
+    label_idemp_key = hashlib.sha256(label_fp.encode("utf-8")).hexdigest()
+
+    # Pre-populate ActionLogs in 'in_progress' state to simulate worker crash right after GitHub accepted calls
+    log_comment = ActionLog(
+        webhook_event_id=event.id,
+        rule_id=rule.id,
+        action_type="create_comment",
+        idempotency_key=comment_idemp_key,
+        status="in_progress",
+        details={"attempt": 1}
+    )
+    log_label = ActionLog(
+        webhook_event_id=event.id,
+        rule_id=rule.id,
+        action_type="add_label",
+        idempotency_key=label_idemp_key,
+        status="in_progress",
+        details={"attempt": 1}
+    )
+    db_session.add_all([log_comment, log_label])
+    await db_session.commit()
+
+    # When recovery worker runs:
+    # list_issue_comments returns the comment that was accepted prior to crash
+    # list_issue_labels returns the label that was accepted prior to crash
+    with patch("backend.app.services.github_client.GitHubClient.list_issue_comments", new_callable=AsyncMock) as mock_list_comments, \
+         patch("backend.app.services.github_client.GitHubClient.list_issue_labels", new_callable=AsyncMock) as mock_list_labels, \
+         patch("backend.app.services.github_client.GitHubClient.add_comment_to_issue", new_callable=AsyncMock) as mock_add_comment, \
+         patch("backend.app.services.github_client.GitHubClient.add_label_to_issue", new_callable=AsyncMock) as mock_add_label:
+
+        mock_list_comments.return_value = [
+            {"id": 555, "body": f"Crash recovery verification\n\n{comment_marker}"}
+        ]
+        mock_list_labels.return_value = ["recovered"]
+
+        # Run recovery execution
+        await process_webhook_event(str(event.id), db=db_session, worker_id="recovery-worker")
+
+        # Proves NO duplicate side-effects were dispatched to GitHub
+        assert mock_add_comment.call_count == 0
+        assert mock_add_label.call_count == 0
+
+        # Verifies that in_progress logs were reconciled to 'success'
+        await db_session.refresh(log_comment)
+        await db_session.refresh(log_label)
+        assert log_comment.status == "success"
+        assert log_comment.details.get("reconciled_after_crash") is True
+        assert log_label.status == "success"
+        assert log_label.details.get("reconciled_after_crash") is True
+

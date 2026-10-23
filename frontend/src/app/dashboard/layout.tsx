@@ -113,6 +113,7 @@ export default function DashboardLayout({
 
           <div className={styles.userRow} title={user?.github_username || ''}>
             {user?.avatar_url ? (
+              /* eslint-disable-next-line @next/next/no-img-element */
               <img
                 src={user.avatar_url}
                 alt={`${user.github_username} avatar`}

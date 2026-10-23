@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.db.session import get_async_session, async_session_maker
 from backend.app.models.user import User
 from backend.app.utils.jwt import decode_session_token
+from backend.app.core.config import settings
 
 # Expose session generator for FastAPI path dependency injection
 get_db = get_async_session

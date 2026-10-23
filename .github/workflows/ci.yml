@@ -56,6 +56,14 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: TypeScript Typecheck
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: Lint Next.js Application
+        working-directory: frontend
+        run: npm run lint
+
       - name: Build Next.js 15 Application
         working-directory: frontend
         run: npm run build

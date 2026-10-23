@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import { ArrowLeft, Trash2, ShieldAlert, Plus, Info } from 'lucide-react';
 import styles from '../../../../../styles/dashboard.module.css';
@@ -48,7 +48,7 @@ export default function RulesPage() {
     'Issue #{number} opened in {repo}: *{title}*'
   );
 
-  const fetchRules = async () => {
+  const fetchRules = useCallback(async () => {
     try {
       const res = await fetch(`/api/v1/repos/${repoId}/rules`);
       if (res.ok) {
@@ -60,11 +60,11 @@ export default function RulesPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [repoId]);
 
   useEffect(() => {
     fetchRules();
-  }, [repoId]);
+  }, [fetchRules]);
 
   const handleToggleRule = async (ruleId: string) => {
     setRules((prev) =>
