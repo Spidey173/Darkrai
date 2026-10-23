@@ -138,6 +138,20 @@ class Settings(BaseSettings):
                 return bool(os.getenv("VERCEL_ENV") or os.getenv("VERCEL_URL"))
         return bool(v)
 
+    @field_validator("EXECUTE_INLINE", mode="before")
+    @classmethod
+    def validate_execute_inline(cls, v: Any) -> bool:
+        if isinstance(v, str):
+            if v.lower() in ("1", "true", "yes"):
+                return True
+            if v.lower() in ("0", "false", "no"):
+                return False
+        if v is True:
+            return True
+        if bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV")):
+            return True
+        return bool(v)
+
     @model_validator(mode="after")
     def validate_security_credentials(self) -> "Settings":
         env = (self.APP_ENV or "development").lower()
