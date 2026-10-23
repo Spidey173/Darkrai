@@ -23,23 +23,42 @@ export default function DashboardLayout({
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // Instant render from session cache if available
+    try {
+      const cached = sessionStorage.getItem('darkrai_user');
+      if (cached) {
+        setUser(JSON.parse(cached));
+        setLoading(false);
+      }
+    } catch {
+      // ignore storage errors
+    }
+
     fetch('/api/v1/auth/me')
       .then((res) => {
         if (!res.ok) {
+          try { sessionStorage.removeItem('darkrai_user'); } catch {}
           router.replace('/');
           return null;
         }
         return res.json();
       })
       .then((data) => {
-        if (data) setUser(data);
+        if (data) {
+          setUser(data);
+          try { sessionStorage.setItem('darkrai_user', JSON.stringify(data)); } catch {}
+        }
         setLoading(false);
       })
-      .catch(() => router.replace('/'));
+      .catch(() => {
+        try { sessionStorage.removeItem('darkrai_user'); } catch {}
+        router.replace('/');
+      });
   }, [router]);
 
   const handleLogout = async () => {
     try {
+      try { sessionStorage.removeItem('darkrai_user'); } catch {}
       const res = await fetch('/api/v1/auth/logout', { method: 'POST' });
       if (res.ok) router.replace('/');
     } catch (e) {

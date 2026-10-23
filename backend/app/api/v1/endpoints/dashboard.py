@@ -37,38 +37,28 @@ async def get_dashboard_stats(
             "active_repositories": 0
         }
 
-    total_events = await db.execute(
-        select(func.count(WebhookEvent.id)).where(WebhookEvent.repository_id.in_(repo_ids))
+    # Consolidated single query for total, completed, and failed counts
+    counts_query = await db.execute(
+        select(
+            func.count(WebhookEvent.id).label("total"),
+            func.count(WebhookEvent.id).filter(WebhookEvent.status == "completed").label("successful"),
+            func.count(WebhookEvent.id).filter(WebhookEvent.status == "failed").label("failed")
+        ).where(WebhookEvent.repository_id.in_(repo_ids))
     )
-    successful_events = await db.execute(
-        select(func.count(WebhookEvent.id)).where(
-            WebhookEvent.repository_id.in_(repo_ids),
-            WebhookEvent.status == "completed"
-        )
-    )
-    failed_events = await db.execute(
-        select(func.count(WebhookEvent.id)).where(
-            WebhookEvent.repository_id.in_(repo_ids),
-            WebhookEvent.status == "failed"
-        )
-    )
+    counts_row = counts_query.one()
 
-    event_ids_query = await db.execute(
-        select(WebhookEvent.id).where(WebhookEvent.repository_id.in_(repo_ids))
+    # Consolidated single query for total action logs across user's repositories
+    actions_count_query = await db.execute(
+        select(func.count(ActionLog.id))
+        .join(WebhookEvent, ActionLog.webhook_event_id == WebhookEvent.id)
+        .where(WebhookEvent.repository_id.in_(repo_ids))
     )
-    event_ids = [e for e, in event_ids_query.all()]
-    
-    total_actions = 0
-    if event_ids:
-        actions_count = await db.execute(
-            select(func.count(ActionLog.id)).where(ActionLog.webhook_event_id.in_(event_ids))
-        )
-        total_actions = actions_count.scalar() or 0
+    total_actions = actions_count_query.scalar() or 0
 
     return {
-        "total_events": total_events.scalar() or 0,
-        "successful_events": successful_events.scalar() or 0,
-        "failed_events": failed_events.scalar() or 0,
+        "total_events": counts_row.total or 0,
+        "successful_events": counts_row.successful or 0,
+        "failed_events": counts_row.failed or 0,
         "total_actions": total_actions,
         "active_repositories": len(repo_ids)
     }
