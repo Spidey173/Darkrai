@@ -83,10 +83,13 @@ async def github_callback(
     # 2. Verify state token matching
     cookie_state = request.cookies.get(STATE_COOKIE_NAME)
     if not cookie_state or cookie_state != state:
-        logger.warning("OAuth state verification failed. Match: %s", cookie_state == state)
+        logger.warning("OAuth state verification failed. Cookie present: %s, match: %s", bool(cookie_state), cookie_state == state)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="OAuth state validation failed. Potential CSRF detected."
+            detail=(
+                "OAuth state validation failed: state cookie missing or mismatched. "
+                "Ensure your GitHub OAuth App Authorization Callback URL matches your current domain."
+            )
         )
 
     # 3. Exchange code for access tokens
