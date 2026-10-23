@@ -22,6 +22,7 @@ class ActionLog(Base):
         ForeignKey("rules.id", ondelete="SET NULL"), nullable=True
     )
     action_type: Mapped[str] = mapped_column(String(50), nullable=False) # e.g. "label", "comment", "slack"
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True) # Deterministic action fingerprint for side-effect deduplication
     status: Mapped[str] = mapped_column(String(20), nullable=False) # "success", "failed"
     details: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     

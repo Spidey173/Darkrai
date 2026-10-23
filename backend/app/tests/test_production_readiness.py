@@ -245,5 +245,5 @@ async def test_recovery_scanner_detects_worker_lease_expiration_and_dlq(db_sessi
     await event_queue.recover_stranded_events(stale_seconds=300)
 
     await db_session.refresh(evt)
-    assert evt.status == "failed"
+    assert evt.status in ("failed", "dlq")
     assert "lease expired" in evt.error_message

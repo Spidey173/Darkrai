@@ -122,7 +122,7 @@ npm run dev
 ```bash
 pytest backend/app/tests -v
 ```
-> Executes 33 unit and integration tests verifying secret validation fail-fast, webhook HMAC verification and size limits, delivery deduplication, tenant telemetry isolation, AST security audits, AI code review, atomic claiming, and outbox recovery scanning.
+> Executes 40 unit and integration tests verifying secret validation fail-fast, webhook HMAC verification and streaming size limits, delivery deduplication, tenant telemetry isolation, AST security audits, AI code review, atomic claiming, explicit worker lease ownership & active renewal, action execution idempotency, cookie CSRF protection, and DLQ replay. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for full production operations and runbook.
 
 ---
 

@@ -1,9 +1,12 @@
+import asyncio
+import hashlib
+import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 from uuid import UUID
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import select, update, or_
 
 from backend.app.core.config import settings
 from backend.app.db.session import async_session_maker
@@ -26,20 +29,30 @@ async def process_webhook_event(
     db: Optional[Any] = None,
     event: Optional[WebhookEvent] = None,
     repository: Optional[Repository] = None,
-    owner_user: Optional[User] = None
+    owner_user: Optional[User] = None,
+    worker_id: Optional[str] = None,
+    lease_duration_seconds: int = 30
 ) -> None:
     if db is None:
         async with async_session_maker() as session:
-            await _process_core(session, event_id, event, repository, owner_user)
+            await _process_core(
+                session, event_id, event, repository, owner_user,
+                worker_id=worker_id, lease_duration_seconds=lease_duration_seconds
+            )
     else:
-        await _process_core(db, event_id, event, repository, owner_user)
+        await _process_core(
+            db, event_id, event, repository, owner_user,
+            worker_id=worker_id, lease_duration_seconds=lease_duration_seconds
+        )
 
 async def _process_core(
     db: Any,
     event_id: str,
     event: Optional[WebhookEvent],
     repository: Optional[Repository],
-    owner_user: Optional[User]
+    owner_user: Optional[User],
+    worker_id: Optional[str] = None,
+    lease_duration_seconds: int = 30
 ) -> None:
     try:
         parsed_id = event_id if isinstance(event_id, UUID) else UUID(str(event_id))
@@ -47,16 +60,26 @@ async def _process_core(
         logger.error("Invalid event_id format: %s", event_id)
         return
 
-    # Atomic DB event claiming: only transition from 'pending' or 'retrying' to 'processing'
+    active_worker_id = worker_id or f"worker-{UUID(int=parsed_id.int).hex[:8]}"
+    now = datetime.now(timezone.utc)
+    lease_expiry = now + timedelta(seconds=lease_duration_seconds)
+
+    # Atomic DB event claiming with explicit worker lease ownership
+    # Only claim if pending/retrying, or if currently processing but lease has expired
     claim_stmt = (
         update(WebhookEvent)
         .where(
             WebhookEvent.id == parsed_id,
-            WebhookEvent.status.in_(["pending", "retrying"])
+            or_(
+                WebhookEvent.status.in_(["pending", "retrying"]),
+                (WebhookEvent.status == "processing") & (WebhookEvent.lease_expires_at <= now)
+            )
         )
         .values(
             status="processing",
-            updated_at=datetime.now(timezone.utc)
+            worker_id=active_worker_id,
+            lease_expires_at=lease_expiry,
+            updated_at=now
         )
     )
     claim_res = await db.execute(claim_stmt)
@@ -66,7 +89,12 @@ async def _process_core(
         chk_res = await db.execute(select(WebhookEvent).where(WebhookEvent.id == parsed_id))
         existing_evt = chk_res.scalar_one_or_none()
         st = existing_evt.status if existing_evt else "missing"
-        logger.info("Webhook event '%s' not claimable (current status: '%s'). Skipping duplicate/concurrent execution.", parsed_id, st)
+        w_id = existing_evt.worker_id if existing_evt else "none"
+        exp = existing_evt.lease_expires_at.isoformat() if existing_evt and existing_evt.lease_expires_at else "none"
+        logger.info(
+            "Webhook event '%s' not claimable (status='%s', worker='%s', lease_expires='%s'). Skipping duplicate/concurrent execution.",
+            parsed_id, st, w_id, exp
+        )
         return
 
     # Fetch freshly claimed event
@@ -76,38 +104,74 @@ async def _process_core(
         logger.error("Webhook event '%s' not found after claiming.", parsed_id)
         return
 
-    # Resolve target repository and owner user to scope telemetry broadcasts
-    if repository is None:
-        repo_result = await db.execute(
-            select(Repository).where(Repository.id == event.repository_id)
-        )
-        repository = repo_result.scalar_one_or_none()
-    if not repository:
-        raise ValueError("Associated repository details not found.")
+    # Launch background lease renewal loop so slow jobs continuously hold ownership
+    lease_renewal_stop = asyncio.Event()
 
-    if owner_user is None:
-        if "user" in repository.__dict__ and repository.__dict__["user"] is not None:
-            owner_user = repository.user
-        else:
-            user_result = await db.execute(select(User).where(User.id == repository.user_id))
-            owner_user = user_result.scalar_one_or_none()
-    if not owner_user:
-        raise ValueError("Repository owner credential record missing.")
+    async def _lease_renewal_loop():
+        interval = max(5.0, min(15.0, lease_duration_seconds / 2.0))
+        while not lease_renewal_stop.is_set():
+            try:
+                await asyncio.wait_for(lease_renewal_stop.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+            
+            try:
+                async with async_session_maker() as renewal_session:
+                    new_expiry = datetime.now(timezone.utc) + timedelta(seconds=lease_duration_seconds)
+                    renew_stmt = (
+                        update(WebhookEvent)
+                        .where(
+                            WebhookEvent.id == parsed_id,
+                            WebhookEvent.worker_id == active_worker_id,
+                            WebhookEvent.status == "processing"
+                        )
+                        .values(
+                            lease_expires_at=new_expiry,
+                            updated_at=datetime.now(timezone.utc)
+                        )
+                    )
+                    await renewal_session.execute(renew_stmt)
+                    await renewal_session.commit()
+            except Exception as ren_err:
+                logger.debug("Lease renewal tick error on event %s: %s", parsed_id, ren_err)
 
-    target_user_id = str(owner_user.id)
-
-    await stream_broker.broadcast("event:processing_started", {
-        "event_id": str(event.id),
-        "event_type": event.event_type,
-        "action": event.action,
-        "delivery_id": str(event.delivery_id)
-    }, user_id=target_user_id)
+    renewal_task = asyncio.create_task(_lease_renewal_loop())
 
     try:
+        # Resolve target repository and owner user to scope telemetry broadcasts
+        if repository is None:
+            repo_result = await db.execute(
+                select(Repository).where(Repository.id == event.repository_id)
+            )
+            repository = repo_result.scalar_one_or_none()
+        if not repository:
+            raise ValueError("Associated repository details not found.")
+
+        if owner_user is None:
+            if "user" in repository.__dict__ and repository.__dict__["user"] is not None:
+                owner_user = repository.user
+            else:
+                user_result = await db.execute(select(User).where(User.id == repository.user_id))
+                owner_user = user_result.scalar_one_or_none()
+        if not owner_user:
+            raise ValueError("Repository owner credential record missing.")
+
+        target_user_id = str(owner_user.id)
+
+        await stream_broker.broadcast("event:processing_started", {
+            "event_id": str(event.id),
+            "event_type": event.event_type,
+            "action": event.action,
+            "delivery_id": str(event.delivery_id),
+            "worker_id": active_worker_id
+        }, user_id=target_user_id)
+
         if not repository.is_active:
             logger.warning("Repository '%s' is inactive. Skipping action execution.", repository.full_name)
             event.status = "completed"
             event.processed_at = datetime.now(timezone.utc)
+            event.lease_expires_at = None
             await db.commit()
             return
 
@@ -117,6 +181,7 @@ async def _process_core(
             logger.info("Skipping event '%s' with non-trigger action '%s'.", event.id, event.action)
             event.status = "completed"
             event.processed_at = datetime.now(timezone.utc)
+            event.lease_expires_at = None
             await db.commit()
             return
 
@@ -181,14 +246,24 @@ async def _process_core(
                     action_type = action.get("type")
                     action_value = action.get("value")
 
+                    # Deterministic action idempotency key
+                    action_val_repr = json.dumps(action_value, sort_keys=True) if isinstance(action_value, (dict, list)) else str(action_value)
+                    action_fingerprint = f"{event.id}:{rule.id}:{action_type}:{action_val_repr}"
+                    idempotency_key = hashlib.sha256(action_fingerprint.encode("utf-8")).hexdigest()
+
+                    # Deduplication / Reconciliation: Skip side effect if already succeeded
                     duplicate_check = await db.execute(
                         select(ActionLog).where(
-                            ActionLog.webhook_event_id == event.id,
-                            ActionLog.action_type == action_type
+                            ActionLog.idempotency_key == idempotency_key,
+                            ActionLog.status == "success"
                         )
                     )
-                    if duplicate_check.scalar_one_or_none():
-                        logger.info("Action '%s' already executed for event '%s'. Skipping.", action_type, event.id)
+                    existing_action = duplicate_check.scalar_one_or_none()
+                    if existing_action:
+                        logger.info(
+                            "Action '%s' (key=%s) already successfully executed for event '%s'. Reconciling and skipping side effects.",
+                            action_type, idempotency_key[:12], event.id
+                        )
                         continue
 
                     status_str = "success"
@@ -313,14 +388,17 @@ async def _process_core(
                         status_str = "failed"
                         details = {"error": str(action_err)}
 
+                    # Persist action state immediately so crashes/retries do not duplicate completed side effects
                     action_log = ActionLog(
                         webhook_event_id=event.id,
                         rule_id=rule.id,
                         action_type=action_type,
+                        idempotency_key=idempotency_key,
                         status=status_str,
                         details=details
                     )
                     db.add(action_log)
+                    await db.commit()
 
                     await stream_broker.broadcast("action:dispatched", {
                         "event_id": str(event.id),
@@ -331,11 +409,13 @@ async def _process_core(
 
         event.status = "completed"
         event.processed_at = datetime.now(timezone.utc)
+        event.lease_expires_at = None
         event.error_message = None
 
     except Exception as err:
         logger.error("Event processing crash on event '%s': %s", event_id, str(err), exc_info=True)
         event.retry_count = (event.retry_count or 0) + 1
+        event.lease_expires_at = None
         if event.retry_count < settings.MAX_EVENT_RETRIES:
             event.status = "retrying"
         else:
@@ -350,6 +430,13 @@ async def _process_core(
         raise
 
     finally:
+        lease_renewal_stop.set()
+        try:
+            renewal_task.cancel()
+            await renewal_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
         await db.commit()
         await stream_broker.broadcast("event:completed", {
             "event_id": str(event_id),

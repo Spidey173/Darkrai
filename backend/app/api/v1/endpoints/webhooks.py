@@ -27,7 +27,7 @@ async def github_webhook_receiver(
     x_hub_signature_256: str = Header(...),
     db: AsyncSession = Depends(get_db)
 ) -> dict:
-    # 1. Enforce payload size limits before or during body read
+    # 1. Enforce payload size limits while streaming body chunks to prevent memory buffering / OOM attacks
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -39,12 +39,17 @@ async def github_webhook_receiver(
         except ValueError:
             pass
 
-    body = await request.body()
-    if len(body) > settings.MAX_WEBHOOK_PAYLOAD_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            detail=f"Webhook payload exceeds maximum size limit of {settings.MAX_WEBHOOK_PAYLOAD_BYTES} bytes."
-        )
+    body_chunks = []
+    total_bytes = 0
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > settings.MAX_WEBHOOK_PAYLOAD_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=f"Webhook payload exceeds maximum size limit of {settings.MAX_WEBHOOK_PAYLOAD_BYTES} bytes."
+            )
+        body_chunks.append(chunk)
+    body = b"".join(body_chunks)
 
     # 2. Validate header presence and non-empty values
     if not x_github_event.strip() or not x_github_delivery.strip() or not x_hub_signature_256.strip():

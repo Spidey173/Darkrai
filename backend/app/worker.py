@@ -14,7 +14,7 @@ setup_logging()
 logger = logging.getLogger("app.worker")
 
 async def run_worker():
-    logger.info("Starting Darkrai Standalone Distributed Queue Worker...")
+    logger.info("Starting Darkrai Standalone Distributed Queue Worker (worker_id: %s)...", event_queue.worker_id)
     await event_queue.start_worker()
 
     stop_event = asyncio.Event()

@@ -15,10 +15,33 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db)
 ) -> User:
     """Dependency validating the session JWT from cookie, Authorization header, or query param, and fetching the active User."""
-    session_token = request.cookies.get("session_token")
+    cookie_token = request.cookies.get("session_token")
+    auth_header = request.headers.get("Authorization")
+    is_bearer = bool(auth_header and auth_header.startswith("Bearer "))
+
+    if cookie_token and not is_bearer and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        # CSRF Protection: Protect cookie-authenticated state-changing requests against CSRF
+        csrf_header = request.headers.get("x-requested-with") or request.headers.get("x-csrf-token")
+        sec_fetch_site = request.headers.get("sec-fetch-site")
+        origin = request.headers.get("origin")
+
+        is_safe = False
+        if sec_fetch_site in ("same-origin", "same-site"):
+            is_safe = True
+        elif csrf_header:
+            is_safe = True
+        elif origin:
+            is_safe = any(origin.startswith(str(o).rstrip("/")) for o in settings.BACKEND_CORS_ORIGINS)
+
+        if not is_safe:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="CSRF validation failed: Cookie-authenticated state-changing request requires X-Requested-With, X-CSRF-Token, or verified origin."
+            )
+
+    session_token = cookie_token
     if not session_token:
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
+        if is_bearer:
             session_token = auth_header[7:].strip()
     if not session_token:
         session_token = request.query_params.get("token")

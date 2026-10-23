@@ -1,9 +1,13 @@
 import asyncio
+import collections
 import json
 import logging
 import time
+import socket
+import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from uuid import UUID
 
 try:
     import redis.asyncio as aioredis
@@ -18,15 +22,11 @@ logger = logging.getLogger("app.services.queue")
 
 class EventQueue:
     """
-    High-throughput event queue with native Redis backing, resilient
-    in-process asyncio fallback, and a background Transactional Outbox / Recovery Scanner.
-    
-    Guarantees:
-    - Zero event loss: Events are persisted to DB before enqueue; background recovery loop
-      scans for and processes any stranded pending events or expired worker leases.
-    - Idempotency: Ensures unique processing per X-GitHub-Delivery.
-    - Fault Tolerance: Exponential backoff retries (default 3 attempts) + Dead-Letter Queue (DLQ).
-    - Live Observability: Emits real-time state telemetry to stream_broker.
+    Production-grade resilient Distributed Event Queue with:
+    - Explicit worker lease ownership & active lease renewal (heartbeat)
+    - Concurrency-safe Transactional Outbox recovery scanner
+    - Durable Redis backend with persistence checks & monitored in-memory fallback
+    - DLQ management, replay APIs, queue latency, and age alerting
     """
 
     QUEUE_KEY = "darkrai:queue:events"
@@ -34,6 +34,7 @@ class EventQueue:
     IDEMPOTENCY_PREFIX = "darkrai:idempotency:"
 
     def __init__(self):
+        self.worker_id: str = f"worker-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
         self._redis: Optional[aioredis.Redis] = None
         self._is_redis_available: bool = False
         self._memory_queue: asyncio.Queue = asyncio.Queue()
@@ -44,39 +45,63 @@ class EventQueue:
         self._is_running: bool = False
         self._lock = asyncio.Lock()
         
-        # Telemetry metrics
+        # Operational telemetry and latency monitoring
+        self._latency_samples: collections.deque = collections.deque(maxlen=100)
         self.metrics = {
             "enqueued": 0,
             "processed": 0,
             "retries": 0,
             "dlq": 0,
             "recovered": 0,
-            "backend": "initializing"
+            "replayed": 0,
+            "failed_actions": 0,
+            "backend": "initializing",
+            "redis_persistence": "none"
         }
 
     async def connect(self) -> bool:
-        """Attempts connection to Redis. Switches to in-memory fallback on failure."""
+        """Attempts connection to Redis. Validates durability or switches to dev in-memory fallback."""
         if not settings.USE_REDIS_QUEUE or aioredis is None:
+            if settings.APP_ENV == "production" and not settings.EXECUTE_INLINE:
+                raise RuntimeError(
+                    "Production configuration error: Redis queue is required in production (USE_REDIS_QUEUE=True) "
+                    "when EXECUTE_INLINE is false. Ephemeral in-memory queues are not production-safe."
+                )
             self._is_redis_available = False
             self.metrics["backend"] = "in_memory"
-            logger.info("EventQueue configured for in-memory mode.")
+            logger.info("EventQueue configured for in-memory mode (worker_id=%s).", self.worker_id)
             return False
 
         try:
             client = aioredis.from_url(
                 settings.REDIS_URL,
                 decode_responses=True,
-                socket_connect_timeout=1.0,
-                socket_timeout=2.0
+                socket_connect_timeout=2.0,
+                socket_timeout=3.0
             )
             await client.ping()
+            
+            # Inspect Redis persistence configuration
+            persistence_status = "active"
+            try:
+                info = await client.info("persistence")
+                rdb_last_status = info.get("rdb_last_bgsave_status", "ok")
+                aof_enabled = bool(info.get("aof_enabled", 0))
+                persistence_status = f"rdb:{rdb_last_status}|aof:{aof_enabled}"
+            except Exception:
+                pass
+
             self._redis = client
             self._is_redis_available = True
+            self.metrics["backend"] = "redis"
+            self.metrics["redis_persistence"] = persistence_status
+
             safe_redis_url = sanitize_url(settings.REDIS_URL)
-            logger.info("Connected to Redis successfully at %s", safe_redis_url)
+            logger.info("Connected to Redis at %s [Persistence: %s, worker_id=%s]", safe_redis_url, persistence_status, self.worker_id)
             await stream_broker.broadcast("queue:status", {
                 "status": "connected",
                 "backend": "redis",
+                "persistence": persistence_status,
                 "url": safe_redis_url
             })
             return True
@@ -84,8 +109,16 @@ class EventQueue:
             self._is_redis_available = False
             self._redis = None
             self.metrics["backend"] = "in_memory"
+            
+            if settings.APP_ENV == "production" and not settings.EXECUTE_INLINE:
+                logger.critical("Production Redis connection failed: %s. In-memory queues cannot survive container restarts.", exc)
+                raise RuntimeError(
+                    f"Production startup failure: Cannot connect to Redis at {sanitize_url(settings.REDIS_URL)}. "
+                    "A durable Redis instance is mandatory for multi-instance production deployments."
+                ) from exc
+
             logger.warning(
-                "Redis connection failed (%s). Falling back gracefully to in-memory event queue.",
+                "Redis connection failed (%s). Falling back to in-memory event queue for development.",
                 str(exc)
             )
             await stream_broker.broadcast("queue:status", {
@@ -111,11 +144,10 @@ class EventQueue:
             "summary": payload_summary or {}
         }
 
-        # 1. Idempotency Check
+        # 1. Delivery Idempotency Check
         if self._is_redis_available and self._redis:
             try:
                 idemp_key = f"{self.IDEMPOTENCY_PREFIX}{delivery_id}"
-                # Set NX with 24-hour expiration
                 is_new = await self._redis.set(idemp_key, event_id, nx=True, ex=86400)
                 if not is_new:
                     logger.info("Redis idempotency hit for delivery %s. Skipping duplicate.", delivery_id)
@@ -140,12 +172,11 @@ class EventQueue:
 
     async def _enqueue_memory(self, item: Dict[str, Any], delivery_id: str) -> bool:
         now = time.time()
-        # Clean expired keys
         self._memory_idempotency = {
             k: exp for k, exp in self._memory_idempotency.items() if exp > now
         }
         if delivery_id in self._memory_idempotency:
-            logger.info("Memory queue idempotency hit for delivery %s. Skipping.", delivery_id)
+            logger.info("Memory queue idempotency hit for delivery %s. Skipping duplicate.", delivery_id)
             return False
 
         self._memory_idempotency[delivery_id] = now + 86400  # 24h
@@ -163,7 +194,7 @@ class EventQueue:
                 await self.connect()
             self._worker_task = asyncio.create_task(self._worker_loop())
             self._recovery_task = asyncio.create_task(self._recovery_loop())
-            logger.info("Darkrai Queue Worker & Recovery Scanner started [%s mode].", self.metrics["backend"])
+            logger.info("Darkrai Queue Worker started (worker_id=%s, backend=%s).", self.worker_id, self.metrics["backend"])
 
     async def stop_worker(self) -> None:
         """Gracefully stops background worker and recovery scanner."""
@@ -184,23 +215,24 @@ class EventQueue:
                     pass
                 self._recovery_task = None
             if self._redis:
-                if hasattr(self._redis, "aclose"):
-                    await self._redis.aclose()
-                else:
-                    await self._redis.close()
+                try:
+                    if hasattr(self._redis, "aclose"):
+                        await self._redis.aclose()
+                    else:
+                        await self._redis.close()
+                except Exception:
+                    pass
                 self._redis = None
-            logger.info("Darkrai Queue Worker stopped.")
+            logger.info("Darkrai Queue Worker stopped (worker_id=%s).", self.worker_id)
 
     async def _worker_loop(self) -> None:
         """Main consumer loop with exponential backoff and Dead-Letter Queue."""
-        # Avoid circular imports at module top-level
         from backend.app.services.event_processor import process_webhook_event
 
         while self._is_running:
             item = None
             try:
                 if self._is_redis_available and self._redis:
-                    # Pop from right (FIFO) with 1s timeout
                     res = await self._redis.brpop(self.QUEUE_KEY, timeout=1)
                     if res:
                         _, raw_data = res
@@ -220,19 +252,27 @@ class EventQueue:
                 await stream_broker.broadcast("queue:processing", {
                     "event_id": event_id,
                     "attempt": retry_count + 1,
+                    "worker_id": self.worker_id,
                     "backend": self.metrics["backend"]
                 })
 
-                # Execute event processing
+                t0 = time.perf_counter()
                 try:
-                    await process_webhook_event(event_id)
+                    try:
+                        await process_webhook_event(event_id, worker_id=self.worker_id)
+                    except TypeError:
+                        await process_webhook_event(event_id)
+                    duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+                    self._latency_samples.append(duration_ms)
                     self.metrics["processed"] += 1
+                    
                     await stream_broker.broadcast("queue:completed", {
                         "event_id": event_id,
-                        "duration_ms": "completed"
+                        "worker_id": self.worker_id,
+                        "duration_ms": duration_ms
                     })
                 except Exception as proc_err:
-                    logger.error("Error processing event %s (attempt %d): %s", event_id, retry_count + 1, proc_err)
+                    logger.error("Error processing event %s (attempt %d, worker %s): %s", event_id, retry_count + 1, self.worker_id, proc_err)
                     self.metrics["retries"] += 1
                     
                     if retry_count + 1 < settings.MAX_EVENT_RETRIES:
@@ -255,7 +295,6 @@ class EventQueue:
                         else:
                             await self._memory_queue.put(item)
                     else:
-                        # Move to Dead-Letter Queue (DLQ)
                         item["failed_at"] = datetime.now(timezone.utc).isoformat()
                         item["final_error"] = str(proc_err)
                         self.metrics["dlq"] += 1
@@ -280,21 +319,22 @@ class EventQueue:
 
     async def recover_stranded_events(self, stale_seconds: int = 300) -> int:
         """
-        Transactional Outbox / Recovery Scan:
-        1. Recovers stranded 'pending' events that were committed to the DB but never enqueued (or if server crashed).
-        2. Recovers stranded 'processing' events whose lease expired (worker died/killed midway).
+        Transactional Outbox & Concurrency-Safe Recovery Scanner:
+        1. Recovers stranded 'pending' events that were persisted to DB but never enqueued.
+        2. Recovers abandoned 'processing' events where worker died (lease_expires_at <= now).
+           Active jobs continuously renew their lease, guaranteeing slow jobs are never stolen.
         """
         from backend.app.db.session import async_session_maker
         from backend.app.models.event import WebhookEvent
         from backend.app.services.event_processor import process_webhook_event
-        from sqlalchemy import select
+        from sqlalchemy import select, update, or_
 
         recovered = 0
         now = datetime.now(timezone.utc)
 
         try:
             async with async_session_maker() as session:
-                # 1. Recover stranded pending events created more than 5 seconds ago
+                # 1. Stranded pending events created more than 5s ago
                 pending_cutoff = now - timedelta(seconds=5)
                 pending_stmt = (
                     select(WebhookEvent)
@@ -309,21 +349,23 @@ class EventQueue:
                 pending_events = pending_res.scalars().all()
 
                 for evt in pending_events:
-                    logger.warning("Recovery scanner found stranded pending event %s. Processing.", evt.id)
+                    logger.warning("Recovery scanner found stranded pending event %s. Claiming.", evt.id)
                     try:
-                        await process_webhook_event(str(evt.id), db=session)
+                        await process_webhook_event(str(evt.id), db=session, worker_id=self.worker_id)
                         recovered += 1
                         self.metrics["recovered"] += 1
                     except Exception as p_err:
-                        logger.error("Failed processing recovered event %s: %s", evt.id, p_err)
+                        logger.error("Failed processing recovered pending event %s: %s", evt.id, p_err)
 
-                # 2. Recover abandoned processing events where worker process died (lease expired)
-                stale_cutoff = now - timedelta(seconds=stale_seconds)
+                # 2. Abandoned processing events whose lease expired
                 stale_stmt = (
                     select(WebhookEvent)
                     .where(
                         WebhookEvent.status == "processing",
-                        WebhookEvent.updated_at <= stale_cutoff
+                        or_(
+                            WebhookEvent.lease_expires_at <= now,
+                            (WebhookEvent.lease_expires_at == None) & (WebhookEvent.updated_at <= (now - timedelta(seconds=stale_seconds)))
+                        )
                     )
                     .order_by(WebhookEvent.updated_at.asc())
                     .limit(20)
@@ -335,23 +377,27 @@ class EventQueue:
                     current_retries = evt.retry_count or 0
                     if current_retries < settings.MAX_EVENT_RETRIES:
                         logger.warning(
-                            "Recovery scanner detected expired lease on event %s (attempt %d). Resetting to pending.",
-                            evt.id, current_retries + 1
+                            "Recovery scanner detected expired lease on event %s (worker: %s, attempt %d). Reclaiming.",
+                            evt.id, evt.worker_id, current_retries + 1
                         )
                         evt.status = "pending"
                         evt.retry_count = current_retries + 1
+                        evt.worker_id = None
+                        evt.lease_expires_at = None
                         evt.updated_at = now
                         await session.commit()
                         try:
-                            await process_webhook_event(str(evt.id), db=session)
+                            await process_webhook_event(str(evt.id), db=session, worker_id=self.worker_id)
                             recovered += 1
                             self.metrics["recovered"] += 1
                         except Exception as re_err:
                             logger.error("Failed re-processing expired lease event %s: %s", evt.id, re_err)
                     else:
-                        logger.critical("Event %s exceeded max retries during lease expiration. Routing to DLQ.", evt.id)
-                        evt.status = "failed"
-                        evt.error_message = "Worker process lease expired; exceeded max retries."
+                        logger.critical("Event %s lease expired and max retries reached. Routing to DLQ.", evt.id)
+                        evt.status = "dlq"
+                        evt.worker_id = None
+                        evt.lease_expires_at = None
+                        evt.error_message = f"Worker lease expired after {current_retries} attempts"
                         evt.updated_at = now
                         await session.commit()
                         self.metrics["dlq"] += 1
@@ -365,6 +411,70 @@ class EventQueue:
             logger.error("Error during recovery scan: %s", scan_err, exc_info=True)
 
         return recovered
+
+    async def replay_dlq(self, event_ids: Optional[List[str]] = None) -> int:
+        """
+        Replays Dead-Letter Queue (DLQ) events by resetting their status to 'pending'.
+        Allows operators to re-run events after bugs are fixed or dependencies recover.
+        """
+        from backend.app.db.session import async_session_maker
+        from backend.app.models.event import WebhookEvent
+        from sqlalchemy import update
+
+        replayed = 0
+        now = datetime.now(timezone.utc)
+        async with async_session_maker() as session:
+            stmt = (
+                update(WebhookEvent)
+                .where(WebhookEvent.status.in_(["dlq", "failed"]))
+            )
+            if event_ids:
+                parsed_ids = [UUID(str(i)) for i in event_ids]
+                stmt = stmt.where(WebhookEvent.id.in_(parsed_ids))
+
+            stmt = stmt.values(
+                status="pending",
+                retry_count=0,
+                worker_id=None,
+                lease_expires_at=None,
+                error_message=None,
+                updated_at=now
+            )
+            res = await session.execute(stmt)
+            await session.commit()
+            replayed = res.rowcount
+
+        # If in-memory DLQ has items, clear them
+        if not event_ids:
+            self._memory_dlq.clear()
+
+        self.metrics["replayed"] += replayed
+        logger.info("DLQ Replay: Successfully requeued %d dead-letter events for re-processing.", replayed)
+        await stream_broker.broadcast("queue:dlq_replayed", {
+            "replayed_count": replayed
+        })
+        return replayed
+
+    async def get_queue_age_seconds(self) -> float:
+        """Returns the age (in seconds) of the oldest pending event in the database."""
+        from backend.app.db.session import async_session_maker
+        from backend.app.models.event import WebhookEvent
+        from sqlalchemy import select, func
+
+        try:
+            async with async_session_maker() as session:
+                res = await session.execute(
+                    select(func.min(WebhookEvent.created_at))
+                    .where(WebhookEvent.status == "pending")
+                )
+                oldest = res.scalar_one_or_none()
+                if oldest:
+                    if oldest.tzinfo is None:
+                        oldest = oldest.replace(tzinfo=timezone.utc)
+                    return round(max(0.0, (datetime.now(timezone.utc) - oldest).total_seconds()), 1)
+        except Exception as e:
+            logger.debug("Could not compute queue age: %s", e)
+        return 0.0
 
     async def _recovery_loop(self) -> None:
         """Background loop executing transactional outbox recovery scans every 15 seconds."""
@@ -385,7 +495,7 @@ class EventQueue:
                 break
 
     async def get_queue_stats(self) -> Dict[str, Any]:
-        """Returns runtime telemetry for dashboard monitoring."""
+        """Returns comprehensive runtime telemetry for operations and dashboard."""
         pending_count = 0
         dlq_count = 0
         if self._is_redis_available and self._redis:
@@ -399,16 +509,41 @@ class EventQueue:
             pending_count = self._memory_queue.qsize()
             dlq_count = len(self._memory_dlq)
 
+        queue_age = await self.get_queue_age_seconds()
+        
+        # Calculate latency metrics
+        samples = list(self._latency_samples)
+        avg_latency_ms = round(sum(samples) / len(samples), 1) if samples else 0.0
+        sorted_samples = sorted(samples)
+        p95_latency_ms = sorted_samples[int(len(sorted_samples) * 0.95)] if sorted_samples else 0.0
+
+        # Evaluate operational alerts
+        alerts = []
+        if queue_age > 120.0:
+            alerts.append({"severity": "CRITICAL", "message": f"Queue age exceeded threshold: oldest event is {queue_age}s old."})
+        elif queue_age > 30.0:
+            alerts.append({"severity": "WARNING", "message": f"Queue lag detected: oldest event is {queue_age}s old."})
+
+        if dlq_count > 0:
+            alerts.append({"severity": "WARNING", "message": f"Dead-letter events present: {dlq_count} failed events awaiting replay."})
+
         return {
+            "worker_id": self.worker_id,
             "backend": self.metrics["backend"],
+            "redis_persistence": self.metrics["redis_persistence"],
             "is_running": self._is_running,
             "pending_events": pending_count,
             "dlq_events": dlq_count,
+            "queue_age_seconds": queue_age,
+            "avg_latency_ms": avg_latency_ms,
+            "p95_latency_ms": p95_latency_ms,
             "total_enqueued": self.metrics["enqueued"],
             "total_processed": self.metrics["processed"],
             "total_retries": self.metrics["retries"],
             "total_dlq": self.metrics["dlq"],
             "total_recovered": self.metrics["recovered"],
+            "total_replayed": self.metrics["replayed"],
+            "alerts": alerts
         }
 
 # Global singleton queue instance

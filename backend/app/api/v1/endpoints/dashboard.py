@@ -135,6 +135,20 @@ async def get_queue_telemetry(
     """Returns queue processing statistics for the authenticated operator."""
     return await event_queue.get_queue_stats()
 
+@router.post("/dlq/replay")
+async def replay_dead_letter_events(
+    payload: Optional[Dict[str, Any]] = None,
+    current_user: User = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Replays dead-letter queue events back into 'pending' status for re-processing."""
+    event_ids = payload.get("event_ids") if payload else None
+    replayed = await event_queue.replay_dlq(event_ids=event_ids)
+    return {
+        "status": "success",
+        "replayed_count": replayed,
+        "message": f"Successfully requeued {replayed} dead-letter events for processing."
+    }
+
 @router.get("/logs")
 async def get_recent_stream_logs(
     current_user: User = Depends(get_current_user)

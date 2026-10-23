@@ -23,8 +23,10 @@ class WebhookEvent(Base, TimestampMixin):
     action: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     payload: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
     
-    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False) # pending, processing, completed, failed
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False) # pending, processing, completed, failed, dlq
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    worker_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True) # Identifier of worker holding active lease
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True) # Lease expiration timestamp
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
