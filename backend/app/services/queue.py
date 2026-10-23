@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
 try:
@@ -18,11 +18,12 @@ logger = logging.getLogger("app.services.queue")
 
 class EventQueue:
     """
-    High-throughput event queue with native Redis backing and resilient
-    in-process asyncio fallback.
+    High-throughput event queue with native Redis backing, resilient
+    in-process asyncio fallback, and a background Transactional Outbox / Recovery Scanner.
     
     Guarantees:
-    - Zero event loss: Falls back to async in-memory queue if Redis is unreachable.
+    - Zero event loss: Events are persisted to DB before enqueue; background recovery loop
+      scans for and processes any stranded pending events or expired worker leases.
     - Idempotency: Ensures unique processing per X-GitHub-Delivery.
     - Fault Tolerance: Exponential backoff retries (default 3 attempts) + Dead-Letter Queue (DLQ).
     - Live Observability: Emits real-time state telemetry to stream_broker.
@@ -39,6 +40,7 @@ class EventQueue:
         self._memory_dlq: list = []
         self._memory_idempotency: Dict[str, float] = {}  # delivery_id -> expiry timestamp
         self._worker_task: Optional[asyncio.Task] = None
+        self._recovery_task: Optional[asyncio.Task] = None
         self._is_running: bool = False
         self._lock = asyncio.Lock()
         
@@ -48,6 +50,7 @@ class EventQueue:
             "processed": 0,
             "retries": 0,
             "dlq": 0,
+            "recovered": 0,
             "backend": "initializing"
         }
 
@@ -151,7 +154,7 @@ class EventQueue:
         return True
 
     async def start_worker(self) -> None:
-        """Starts background consumption worker task."""
+        """Starts background consumption worker task and transactional recovery scanner."""
         async with self._lock:
             if self._is_running:
                 return
@@ -159,10 +162,11 @@ class EventQueue:
             if self._redis is None:
                 await self.connect()
             self._worker_task = asyncio.create_task(self._worker_loop())
-            logger.info("Darkrai Queue Worker started [%s mode].", self.metrics["backend"])
+            self._recovery_task = asyncio.create_task(self._recovery_loop())
+            logger.info("Darkrai Queue Worker & Recovery Scanner started [%s mode].", self.metrics["backend"])
 
     async def stop_worker(self) -> None:
-        """Gracefully stops background worker."""
+        """Gracefully stops background worker and recovery scanner."""
         async with self._lock:
             self._is_running = False
             if self._worker_task:
@@ -172,6 +176,13 @@ class EventQueue:
                 except asyncio.CancelledError:
                     pass
                 self._worker_task = None
+            if self._recovery_task:
+                self._recovery_task.cancel()
+                try:
+                    await self._recovery_task
+                except asyncio.CancelledError:
+                    pass
+                self._recovery_task = None
             if self._redis:
                 if hasattr(self._redis, "aclose"):
                     await self._redis.aclose()
@@ -267,6 +278,112 @@ class EventQueue:
                 logger.error("Queue worker loop error: %s", loop_err, exc_info=True)
                 await asyncio.sleep(1.0)
 
+    async def recover_stranded_events(self, stale_seconds: int = 300) -> int:
+        """
+        Transactional Outbox / Recovery Scan:
+        1. Recovers stranded 'pending' events that were committed to the DB but never enqueued (or if server crashed).
+        2. Recovers stranded 'processing' events whose lease expired (worker died/killed midway).
+        """
+        from backend.app.db.session import async_session_maker
+        from backend.app.models.event import WebhookEvent
+        from backend.app.services.event_processor import process_webhook_event
+        from sqlalchemy import select
+
+        recovered = 0
+        now = datetime.now(timezone.utc)
+
+        try:
+            async with async_session_maker() as session:
+                # 1. Recover stranded pending events created more than 5 seconds ago
+                pending_cutoff = now - timedelta(seconds=5)
+                pending_stmt = (
+                    select(WebhookEvent)
+                    .where(
+                        WebhookEvent.status == "pending",
+                        WebhookEvent.created_at <= pending_cutoff
+                    )
+                    .order_by(WebhookEvent.created_at.asc())
+                    .limit(20)
+                )
+                pending_res = await session.execute(pending_stmt)
+                pending_events = pending_res.scalars().all()
+
+                for evt in pending_events:
+                    logger.warning("Recovery scanner found stranded pending event %s. Processing.", evt.id)
+                    try:
+                        await process_webhook_event(str(evt.id), db=session)
+                        recovered += 1
+                        self.metrics["recovered"] += 1
+                    except Exception as p_err:
+                        logger.error("Failed processing recovered event %s: %s", evt.id, p_err)
+
+                # 2. Recover abandoned processing events where worker process died (lease expired)
+                stale_cutoff = now - timedelta(seconds=stale_seconds)
+                stale_stmt = (
+                    select(WebhookEvent)
+                    .where(
+                        WebhookEvent.status == "processing",
+                        WebhookEvent.updated_at <= stale_cutoff
+                    )
+                    .order_by(WebhookEvent.updated_at.asc())
+                    .limit(20)
+                )
+                stale_res = await session.execute(stale_stmt)
+                stale_events = stale_res.scalars().all()
+
+                for evt in stale_events:
+                    current_retries = evt.retry_count or 0
+                    if current_retries < settings.MAX_EVENT_RETRIES:
+                        logger.warning(
+                            "Recovery scanner detected expired lease on event %s (attempt %d). Resetting to pending.",
+                            evt.id, current_retries + 1
+                        )
+                        evt.status = "pending"
+                        evt.retry_count = current_retries + 1
+                        evt.updated_at = now
+                        await session.commit()
+                        try:
+                            await process_webhook_event(str(evt.id), db=session)
+                            recovered += 1
+                            self.metrics["recovered"] += 1
+                        except Exception as re_err:
+                            logger.error("Failed re-processing expired lease event %s: %s", evt.id, re_err)
+                    else:
+                        logger.critical("Event %s exceeded max retries during lease expiration. Routing to DLQ.", evt.id)
+                        evt.status = "failed"
+                        evt.error_message = "Worker process lease expired; exceeded max retries."
+                        evt.updated_at = now
+                        await session.commit()
+                        self.metrics["dlq"] += 1
+                        await stream_broker.broadcast("queue:dlq", {
+                            "event_id": str(evt.id),
+                            "final_error": evt.error_message,
+                            "action": "moved_to_dlq"
+                        }, level="ERROR")
+
+        except Exception as scan_err:
+            logger.error("Error during recovery scan: %s", scan_err, exc_info=True)
+
+        return recovered
+
+    async def _recovery_loop(self) -> None:
+        """Background loop executing transactional outbox recovery scans every 15 seconds."""
+        try:
+            await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            return
+
+        while self._is_running:
+            try:
+                await self.recover_stranded_events()
+            except Exception as loop_err:
+                logger.error("Recovery loop encountered an error: %s", loop_err, exc_info=True)
+
+            try:
+                await asyncio.sleep(15.0)
+            except asyncio.CancelledError:
+                break
+
     async def get_queue_stats(self) -> Dict[str, Any]:
         """Returns runtime telemetry for dashboard monitoring."""
         pending_count = 0
@@ -291,6 +408,7 @@ class EventQueue:
             "total_processed": self.metrics["processed"],
             "total_retries": self.metrics["retries"],
             "total_dlq": self.metrics["dlq"],
+            "total_recovered": self.metrics["recovered"],
         }
 
 # Global singleton queue instance

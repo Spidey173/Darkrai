@@ -161,16 +161,22 @@ async def github_webhook_receiver(
                 logger.error("Failed processing event inline: %s", proc_err, exc_info=True)
             queue_backend = "inline"
         else:
-            # Asynchronous background worker execution
-            await event_queue.enqueue(
-                event_id=str(new_event.id),
-                delivery_id=str(x_github_delivery),
-                payload_summary={
-                    "event_type": x_github_event,
-                    "action": action,
-                    "repo": repo_name
-                }
-            )
+            # Asynchronous background worker execution with transactional outbox guarantee
+            try:
+                await event_queue.enqueue(
+                    event_id=str(new_event.id),
+                    delivery_id=str(x_github_delivery),
+                    payload_summary={
+                        "event_type": x_github_event,
+                        "action": action,
+                        "repo": repo_name
+                    }
+                )
+            except Exception as enqueue_err:
+                logger.warning(
+                    "Direct queue dispatch failed for event %s: %s. Event is safely committed to DB; recovery scan will process it.",
+                    new_event.id, enqueue_err
+                )
             queue_backend = event_queue.metrics["backend"]
 
         return {

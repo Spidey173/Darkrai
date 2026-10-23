@@ -1,5 +1,6 @@
 import os
 import uuid
+from datetime import datetime, timezone, timedelta
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -155,3 +156,94 @@ async def test_atomic_event_claiming_prevents_duplicate_processing(db_session: A
     await db_session.refresh(evt)
     # Status remains processing, was not re-claimed
     assert evt.status == "processing"
+
+@pytest.mark.asyncio
+async def test_recovery_scanner_processes_stranded_pending_events(db_session: AsyncSession):
+    user = User(
+        github_user_id=10101,
+        github_username="recuser",
+        github_access_token_encrypted=encrypt_token("tok")
+    )
+    db_session.add(user)
+    await db_session.flush()
+
+    repo = Repository(
+        user_id=user.id,
+        github_repo_id=20202,
+        name="rec-repo",
+        owner="recuser",
+        full_name="recuser/rec-repo",
+        is_active=True,
+        webhook_secret_encrypted=encrypt_token("sec")
+    )
+    db_session.add(repo)
+    await db_session.flush()
+
+    # Stranded pending event created 10 seconds ago (never enqueued due to simulated crash)
+    ten_seconds_ago = datetime.now(timezone.utc) - timedelta(seconds=10)
+    evt = WebhookEvent(
+        repository_id=repo.id,
+        delivery_id=uuid.uuid4(),
+        event_type="issues",
+        action="opened",
+        payload={"action": "opened", "issue": {"number": 99, "title": "Recovered Bug"}},
+        status="pending",
+        retry_count=0,
+        created_at=ten_seconds_ago
+    )
+    db_session.add(evt)
+    await db_session.commit()
+    await db_session.refresh(evt)
+
+    # Trigger recovery scan
+    from backend.app.services.queue import event_queue
+    recovered = await event_queue.recover_stranded_events()
+    assert recovered >= 1
+
+    await db_session.refresh(evt)
+    assert evt.status == "completed"
+
+@pytest.mark.asyncio
+async def test_recovery_scanner_detects_worker_lease_expiration_and_dlq(db_session: AsyncSession):
+    user = User(
+        github_user_id=30303,
+        github_username="leaseuser",
+        github_access_token_encrypted=encrypt_token("tok")
+    )
+    db_session.add(user)
+    await db_session.flush()
+
+    repo = Repository(
+        user_id=user.id,
+        github_repo_id=40404,
+        name="lease-repo",
+        owner="leaseuser",
+        full_name="leaseuser/lease-repo",
+        is_active=True,
+        webhook_secret_encrypted=encrypt_token("sec")
+    )
+    db_session.add(repo)
+    await db_session.flush()
+
+    # Event stranded in 'processing' whose worker died over 300s ago, with max retries exceeded
+    stale_time = datetime.now(timezone.utc) - timedelta(seconds=350)
+    evt = WebhookEvent(
+        repository_id=repo.id,
+        delivery_id=uuid.uuid4(),
+        event_type="issues",
+        action="opened",
+        payload={"action": "opened", "issue": {"number": 100, "title": "Dead Worker Event"}},
+        status="processing",
+        retry_count=3,  # Max retries
+        updated_at=stale_time
+    )
+    db_session.add(evt)
+    await db_session.commit()
+    await db_session.refresh(evt)
+
+    from backend.app.services.queue import event_queue
+    await event_queue.recover_stranded_events(stale_seconds=300)
+
+    await db_session.refresh(evt)
+    assert evt.status == "failed"
+    assert "lease expired" in evt.error_message

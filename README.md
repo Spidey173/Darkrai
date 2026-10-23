@@ -2,15 +2,17 @@
 
 ### Live Demo: [https://darkrai-one.vercel.app/](https://darkrai-one.vercel.app/)
 
-Darkrai is a production-grade, event-driven GitHub automation platform that ingests repository webhooks, evaluates rule-based workflows, and executes automated actions such as issue labeling, contextual comments, security alerts, and Slack notifications. The platform includes a real-time observability dashboard for monitoring event ingestion, queue lifecycle, and rule executions.
+Darkrai is an event-driven GitHub automation platform that ingests repository webhooks, evaluates rule-based workflows, and executes automated actions such as issue labeling, contextual comments, security alerts, and Slack notifications. The platform includes a real-time observability dashboard for monitoring event ingestion, queue lifecycle, and rule executions.
 
 ---
 
 ## ⚡ Key Capabilities 
 
-- **Reliable Dual-Mode Processing**:
-  - **Worker Queue Mode**: Durable Redis queue backing with exponential backoff retries, atomic DB event claiming (`UPDATE ... WHERE status = 'pending'`), and Dead-Letter Queue (DLQ) routing.
-  - **Serverless / Inline Mode**: Instant, synchronous inline execution (`EXECUTE_INLINE=true`) optimized for serverless functions (e.g., Vercel) where background processes cannot outlive the HTTP request lifecycle.
+- **Reliable Event Ingestion & Outbox Recovery**:
+  - **Transactional Outbox & Recovery Scanner**: Webhook events are committed to PostgreSQL / SQLite before HTTP acknowledgment. A background recovery scanner continuously audits for stranded pending events (e.g. if a server crashes before queueing) and expired worker leases (e.g. if a worker process crashes midway), reclaiming and re-dispatching them safely.
+  - **Dual-Mode Processing**:
+    - **Worker Queue Mode**: Durable Redis queue backing with exponential backoff retries, atomic DB event claiming (`UPDATE ... WHERE status = 'pending'`), and Dead-Letter Queue (DLQ) routing.
+    - **Serverless / Inline Mode**: Instant inline execution (`EXECUTE_INLINE=true`) optimized for serverless functions (e.g., Vercel) where background processes cannot outlive the HTTP request lifecycle.
 - **Hardened Security & Isolation**:
   - **HMAC-SHA256 Raw Verification**: GitHub webhooks verified over raw bytes before trusting payloads, with 2MB maximum size limits and delivery deduplication.
   - **Fail-Fast Secret Validation**: Production startup enforces cryptographic strength for `SECRET_KEY` and `ENCRYPTION_KEY`, with zero-config fallbacks strictly limited to local development.
@@ -18,7 +20,7 @@ Darkrai is a production-grade, event-driven GitHub automation platform that inge
   - **Multi-Tenant Telemetry Isolation**: Dashboard telemetry endpoints (`/queue`, `/logs`, `/stream`, `/ws`) require authentication and strictly scope logs, SSE, and WebSocket broadcasts to the authenticated user.
 - **Python AST Static Security Linter**: Inspects PR diffs and patches via Python's Abstract Syntax Tree (`ast`) to detect and flag critical vulnerabilities (`eval()`, shell command injection, raw SQL formatting, hardcoded secrets, and insecure deserialization).
 - **AI Automated Code Reviewer**: Generates architectural summaries, suggests edge-case unit tests, and classifies PRs with semantic labels using Google Gemini / OpenAI with offline heuristic fallback.
-- **Zero-Config Testing & Local Dev**: Seamless SQLite fallback and 100% green test suite (31 tests) running in `< 0.5s` without external services.
+- **CI Pipeline & Test Suite**: Continuous integration via GitHub Actions (`.github/workflows/ci.yml`) testing on Python 3.11, Python 3.12, and Node.js 20 with Next.js 15 build validation.
 
 ---
 
@@ -26,16 +28,16 @@ Darkrai is a production-grade, event-driven GitHub automation platform that inge
 
 ```
 ┌─────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
-│  GitHub Event   │ ────► │ FastAPI Webhook Gateway│ ────► │ Atomic Event Claiming  │
-│ (Issue / PR)    │       │ (HMAC Verify & Limits) │       │ (UPDATE status='proc') │
+│  GitHub Event   │ ────► │ FastAPI Webhook Gateway│ ────► │ DB Persistence (Commit)│
+│ (Issue / PR)    │       │ (HMAC Verify & Limits) │       │ (Outbox Source-of-Truth│
 └─────────────────┘       └──────────┬─────────────┘       └──────────┬─────────────┘
                                      │                                │
                   ┌──────────────────┴──────────────────┐             ▼
                   │                                     │   ┌────────────────────────┐
-                  ▼                                     ▼   │ Execution Engine       │
-     [Serverless / Inline Mode]            [Worker Queue Mode]│  ├─ AST Security Linter │
-     (Execute Inline before Ack)           (Durable Redis +  │  ├─ AI Code Reviewer  │
-                  │                         DLQ Retries)     │  └─ Action Dispatcher  │
+                  ▼                                     ▼   │ Atomic Event Claiming  │
+     [Serverless / Inline Mode]            [Worker Queue Mode]│ (UPDATE status='proc') │
+     (Execute Inline before Ack)           (Queue Dispatch + │  ├─ Fast-Path Worker  │
+                  │                         Recovery Scanner)│  └─ Lease Recovery    │
                   │                                     │   └──────────┬─────────────┘
                   └──────────────────┬──────────────────┘              │
                                      ▼                                 │
@@ -48,7 +50,7 @@ Darkrai is a production-grade, event-driven GitHub automation platform that inge
                                      │                      │ (Tenant-Isolated)      │
                                      ▼                      └──────────┬─────────────┘
                           ┌────────────────────────────────────────────▼─────────────┐
-                          │ Next.js 14 Observability Command Center (Real-Time)      │
+                          │ Next.js 15 Observability Command Center (Real-Time)      │
                           └──────────────────────────────────────────────────────────┘
 ```
 
@@ -57,7 +59,7 @@ Darkrai is a production-grade, event-driven GitHub automation platform that inge
 ## 🛠️ Tech Stack
 
 ### Frontend
-- Next.js 14 (App Router)
+- Next.js 15 (App Router)
 - React 18 & Lucide Icons
 - Server-Sent Events (SSE) & Real-Time WebSockets
 - Magma Dark Luxury CSS Design System
@@ -65,12 +67,14 @@ Darkrai is a production-grade, event-driven GitHub automation platform that inge
 ### Backend
 - FastAPI & Starlette Async WebSockets
 - Distributed Queue (Redis Async with in-process asyncio fallback)
+- Transactional Outbox Recovery Scanner
 - Python AST (`ast`) Static Security Engine
 - AI PR Review Engine (Google Gemini / OpenAI / Heuristic)
 - SQLAlchemy 2.0 Async (PostgreSQL + aiosqlite fallback)
-- Pytest & Pytest-Asyncio (100% Green Test Suite)
+- Pytest & Pytest-Asyncio (33 Unit & Integration Tests)
 
-### Infrastructure
+### Infrastructure & CI/CD
+- GitHub Actions CI (`.github/workflows/ci.yml`)
 - PostgreSQL (Neon Serverless)
 - Redis / In-Memory Queue
 - Vercel (Frontend & Backend Hosting)
@@ -118,7 +122,7 @@ npm run dev
 ```bash
 pytest backend/app/tests -v
 ```
-> Runs 31 isolated integration tests in `< 0.5s` validating secret validation, webhook signatures, deduplication, tenant telemetry isolation, AST security audits, AI code review, and atomic event claiming.
+> Executes 33 unit and integration tests verifying secret validation fail-fast, webhook HMAC verification and size limits, delivery deduplication, tenant telemetry isolation, AST security audits, AI code review, atomic claiming, and outbox recovery scanning.
 
 ---
 
@@ -136,11 +140,11 @@ pytest backend/app/tests -v
 
 ### 3. Backend Deployment Architecture
 - **Serverless Deployments (Vercel)**:
-  - In serverless runtime environments, set `EXECUTE_INLINE=true` (or let Vercel auto-detect).
+  - In serverless runtime environments, set `EXECUTE_INLINE=true` (automatically enabled when `VERCEL=1`).
   - This ensures webhooks execute all rule actions synchronously before the request lifecycle terminates.
 - **Container / Dedicated Worker Deployments (Docker, ECS, Fly.io, Railway)**:
   - For continuous background consumer loops and high-concurrency event bursts, deploy the backend container with `EXECUTE_INLINE=false` and a Redis connection string (`REDIS_URL`).
-  - Darkrai's atomic database state transitions (`UPDATE ... WHERE status = 'pending'`) guarantee safe event claiming across multiple concurrent worker replicas.
+  - Darkrai's background recovery scanner audits for stranded pending events and expired leases every 15 seconds, while atomic DB transitions (`UPDATE ... WHERE status = 'pending'`) guarantee safe event claiming across multiple concurrent worker replicas.
 
 ---
 

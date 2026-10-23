@@ -86,7 +86,7 @@ async def _process_core(
         raise ValueError("Associated repository details not found.")
 
     if owner_user is None:
-        if hasattr(repository, "user") and repository.user is not None:
+        if "user" in repository.__dict__ and repository.__dict__["user"] is not None:
             owner_user = repository.user
         else:
             user_result = await db.execute(select(User).where(User.id == repository.user_id))
@@ -156,7 +156,7 @@ async def _process_core(
                 "ast_report": ast_report
             }
 
-        if hasattr(repository, "rules") and repository.rules:
+        if "rules" in repository.__dict__ and repository.__dict__["rules"]:
             active_rules = [r for r in repository.rules if r.event_type == event.event_type and r.is_active]
         else:
             rules_result = await db.execute(
