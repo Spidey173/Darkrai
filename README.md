@@ -20,7 +20,7 @@ Darkrai is an event-driven GitHub automation platform that ingests repository we
   - **Multi-Tenant Telemetry Isolation**: Dashboard telemetry endpoints (`/queue`, `/logs`, `/stream`, `/ws`) require authentication and strictly scope logs, SSE, and WebSocket broadcasts to the authenticated user.
 - **Python AST Static Security Linter**: Inspects PR diffs and patches via Python's Abstract Syntax Tree (`ast`) to detect and flag critical vulnerabilities (`eval()`, shell command injection, raw SQL formatting, hardcoded secrets, and insecure deserialization).
 - **AI Automated Code Reviewer**: Generates architectural summaries, suggests edge-case unit tests, and classifies PRs with semantic labels using Google Gemini / OpenAI with offline heuristic fallback.
-- **CI Pipeline & Test Suite**: Continuous integration via GitHub Actions (`.github/workflows/ci.yml`) testing on Python 3.11, Python 3.12, and Node.js 20 with Next.js 15 build validation.
+- **CI Pipeline & Test Suite**: Continuous integration via GitHub Actions (`.github/workflows/ci.yml`) testing on Python 3.11, Python 3.12, and Node.js 22 with TypeScript typecheck, Next.js ESLint, and production build validation.
 
 ---
 
