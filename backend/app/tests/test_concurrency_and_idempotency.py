@@ -65,10 +65,10 @@ async def test_concurrent_multiple_workers_competing(db_session: AsyncSession):
     worker_3_id = "worker-gamma-003"
 
     results = await asyncio.gather(
-        process_webhook_event(str(event.id), db=db_session, worker_id=worker_1_id),
-        process_webhook_event(str(event.id), db=db_session, worker_id=worker_2_id),
-        process_webhook_event(str(event.id), db=db_session, worker_id=worker_3_id),
-        return_exceptions=True
+        process_webhook_event(str(event.id), db=None, worker_id=worker_1_id),
+        process_webhook_event(str(event.id), db=None, worker_id=worker_2_id),
+        process_webhook_event(str(event.id), db=None, worker_id=worker_3_id),
+        return_exceptions=False
     )
 
     # Refresh event from DB
