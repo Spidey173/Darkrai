@@ -1,7 +1,8 @@
 import ast
 import re
+import textwrap
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 SECRET_PATTERNS = [
     (r"ghp_[a-zA-Z0-9]{36}", "GitHub Personal Access Token", "CRITICAL"),
@@ -243,8 +244,194 @@ class _SecurityVisitor(ast.NodeVisitor):
 class ASTSecurityLinter:
     """Static security analysis linter using Python's Abstract Syntax Tree (AST)."""
 
+    @staticmethod
+    def is_unified_diff(text: str) -> bool:
+        """Determines if the provided code snippet is a Git unified diff / patch."""
+        if not text:
+            return False
+        first_lines = text.strip().splitlines()[:10]
+        for line in first_lines:
+            if line.startswith("diff --git") or line.startswith("@@ ") or line.startswith("--- ") or line.startswith("+++ "):
+                return True
+        return False
+
+    @classmethod
+    def extract_python_from_diff(cls, diff_text: str) -> List[Tuple[str, str, int]]:
+        """
+        Parses a unified diff and extracts added/modified Python code blocks.
+        Returns a list of tuples: (filename, extracted_code_block, starting_line_number).
+        """
+        blocks: List[Tuple[str, str, int]] = []
+        current_file = "patch.py"
+        is_python_file = True
+        current_added_lines: List[str] = []
+        hunk_start_line = 1
+
+        lines = diff_text.splitlines()
+        for line in lines:
+            if line.startswith("diff --git"):
+                if current_added_lines and is_python_file:
+                    raw_block = "\n".join(current_added_lines)
+                    dedented = textwrap.dedent(raw_block).strip()
+                    if dedented:
+                        blocks.append((current_file, dedented, hunk_start_line))
+                current_added_lines = []
+
+                # Extract filename from diff header
+                parts = line.split()
+                if len(parts) >= 4:
+                    b_path = parts[3]
+                    current_file = b_path[2:] if b_path.startswith("b/") else b_path
+                is_python_file = current_file.endswith(".py") or not ("." in current_file)
+
+            elif line.startswith("+++ "):
+                target_path = line[4:].strip()
+                if target_path.startswith("b/"):
+                    current_file = target_path[2:]
+                elif target_path != "/dev/null":
+                    current_file = target_path
+                is_python_file = current_file.endswith(".py") or not ("." in current_file)
+
+            elif line.startswith("@@ "):
+                if current_added_lines and is_python_file:
+                    raw_block = "\n".join(current_added_lines)
+                    dedented = textwrap.dedent(raw_block).strip()
+                    if dedented:
+                        blocks.append((current_file, dedented, hunk_start_line))
+                current_added_lines = []
+
+                # Extract new line start from @@ -x,y +z,w @@
+                hunk_match = re.search(r"\+(\d+)", line)
+                if hunk_match:
+                    hunk_start_line = int(hunk_match.group(1))
+
+            elif line.startswith("+") and not line.startswith("+++"):
+                # Added line inside the hunk
+                current_added_lines.append(line[1:])  # Strip leading '+'
+
+        # Flush any trailing block
+        if current_added_lines and is_python_file:
+            raw_block = "\n".join(current_added_lines)
+            dedented = textwrap.dedent(raw_block).strip()
+            if dedented:
+                blocks.append((current_file, dedented, hunk_start_line))
+
+        return blocks
+
     @classmethod
     def analyze_code(cls, source_code: str, filename: str = "patch.py") -> ASTAnalysisReport:
+        if not source_code or not source_code.strip():
+            return ASTAnalysisReport(
+                filename=filename,
+                is_safe=True,
+                risk_score=0,
+                total_findings=0,
+                findings=[],
+                analyzed_lines=0
+            )
+
+        # Handle Git unified diffs by extracting added Python code blocks
+        if cls.is_unified_diff(source_code):
+            diff_blocks = cls.extract_python_from_diff(source_code)
+            if not diff_blocks:
+                # No Python additions in this diff (e.g. docs, config, or deletion-only)
+                return ASTAnalysisReport(
+                    filename=filename,
+                    is_safe=True,
+                    risk_score=0,
+                    total_findings=0,
+                    findings=[],
+                    analyzed_lines=len(source_code.splitlines())
+                )
+
+            all_findings: List[Finding] = []
+            analyzed_line_count = 0
+
+            for file_name, code_block, start_line in diff_blocks:
+                block_lines = code_block.splitlines()
+                analyzed_line_count += len(block_lines)
+
+                # Try parsing the code block as an AST tree
+                tree = None
+                try:
+                    tree = ast.parse(code_block, filename=file_name)
+                except SyntaxError:
+                    # Incomplete block (e.g. return statement or inner body). Try wrapping in dummy function
+                    try:
+                        wrapped_code = f"def _diff_hunk_wrapper():\n{textwrap.indent(code_block, '    ')}"
+                        tree = ast.parse(wrapped_code, filename=file_name)
+                    except SyntaxError:
+                        tree = None
+
+                if tree:
+                    visitor = _SecurityVisitor(block_lines)
+                    visitor.visit(tree)
+                    # Adjust line numbers relative to the diff start line
+                    for f in visitor.findings:
+                        adjusted_line = start_line + max(0, f.line - 1)
+                        all_findings.append(Finding(
+                            rule_id=f.rule_id,
+                            severity=f.severity,
+                            line=adjusted_line,
+                            col=f.col,
+                            message=f.message,
+                            snippet=f.snippet,
+                            recommendation=f.recommendation
+                        ))
+                else:
+                    # Fallback line-by-line pattern matching for fragments that cannot form a complete AST
+                    for idx, line in enumerate(block_lines):
+                        line_num = start_line + idx
+                        # Check dangerous calls
+                        if re.search(r"\b(eval|exec)\s*\(", line):
+                            all_findings.append(Finding(
+                                rule_id="AST_SEC_001_DANGEROUS_EXEC",
+                                severity="CRITICAL",
+                                line=line_num,
+                                col=0,
+                                message="Dangerous dynamic code execution call detected in patch.",
+                                snippet=line.strip(),
+                                recommendation="Avoid dynamic execution. Use structured parsers instead."
+                            ))
+                        if re.search(r"\bos\.(system|popen)\s*\(", line) or "shell=True" in line:
+                            all_findings.append(Finding(
+                                rule_id="AST_SEC_002_COMMAND_INJECTION",
+                                severity="CRITICAL",
+                                line=line_num,
+                                col=0,
+                                message="Potential command injection in patch.",
+                                snippet=line.strip(),
+                                recommendation="Avoid shell execution with untrusted parameters."
+                            ))
+                        # Check hardcoded secrets
+                        for pattern, pattern_name, severity in SECRET_PATTERNS:
+                            if re.search(pattern, line):
+                                all_findings.append(Finding(
+                                rule_id="AST_SEC_005_HARDCODED_SECRET",
+                                severity=severity,
+                                line=line_num,
+                                col=0,
+                                message=f"Hardcoded {pattern_name} pattern found in patch literal.",
+                                snippet=line.strip(),
+                                recommendation="Immediately rotate this secret and load via environment variables."
+                            ))
+                            break
+
+            weights = {"CRITICAL": 40, "HIGH": 25, "MEDIUM": 10, "LOW": 5}
+            total_risk = sum(weights.get(f.severity, 5) for f in all_findings)
+            risk_score = min(100, total_risk)
+            is_safe = not any(f.severity in ("CRITICAL", "HIGH") for f in all_findings)
+
+            return ASTAnalysisReport(
+                filename=filename,
+                is_safe=is_safe,
+                risk_score=risk_score,
+                total_findings=len(all_findings),
+                findings=all_findings,
+                analyzed_lines=analyzed_line_count
+            )
+
+        # Standard Python module analysis (standalone source file)
         lines = source_code.splitlines()
         try:
             tree = ast.parse(source_code, filename=filename)

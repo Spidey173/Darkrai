@@ -162,31 +162,22 @@ export default function OverviewPage() {
     fetchTelemetry();
     const interval = setInterval(fetchTelemetry, 8000);
 
-    // Initial contextual logs for immediate terminal visualization
+    // Initial operational log entry
     setLogs([
       {
         type: 'system:ready',
         level: 'INFO',
         timestamp: new Date().toISOString(),
-        data: { message: 'Darkrai Distributed Event Engine initialized in Tier S (9.2+) mode.' }
-      },
-      {
-        type: 'queue:status',
-        level: 'INFO',
-        timestamp: new Date().toISOString(),
-        data: { backend: 'Redis / Distributed Async Worker', status: 'Online', max_retries: 3 }
-      },
-      {
-        type: 'ast_security:ready',
-        level: 'INFO',
-        timestamp: new Date().toISOString(),
-        data: { engine: 'Python AST Security Linter', rules_active: 8, ai_provider: 'Gemini / AST Heuristic' }
+        data: { message: 'Darkrai event listener active. Awaiting GitHub webhooks.' }
       }
     ]);
 
-    // Use SSE stream in development or supported streaming environments
+    let ws: WebSocket | null = null;
     let eventSource: EventSource | null = null;
-    if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
+    let isCancelled = false;
+
+    const startSSE = () => {
+      if (isCancelled) return;
       try {
         eventSource = new EventSource('/api/v1/dashboard/stream');
         eventSource.onopen = () => setIsLiveConnected(true);
@@ -195,17 +186,58 @@ export default function OverviewPage() {
             const parsed = JSON.parse(e.data);
             setLogs((prev) => [...prev.slice(-99), parsed]);
           } catch {
-            // ignore non-json heartbeats
+            // Heartbeat or non-json message
           }
         };
-        eventSource.onerror = () => setIsLiveConnected(false);
+        eventSource.onerror = () => {
+          setIsLiveConnected(false);
+        };
       } catch {
-        // SSE fallback handled by polling
+        setIsLiveConnected(false);
+      }
+    };
+
+    // Try WebSocket connection first; fallback to Server-Sent Events (SSE)
+    if (typeof window !== 'undefined') {
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/api/v1/dashboard/ws`;
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          setIsLiveConnected(true);
+        };
+
+        ws.onmessage = (e) => {
+          try {
+            const parsed = JSON.parse(e.data);
+            if (parsed.type !== 'pong') {
+              setLogs((prev) => [...prev.slice(-99), parsed]);
+            }
+          } catch {
+            // ignore non-json frames
+          }
+        };
+
+        ws.onerror = () => {
+          ws?.close();
+          startSSE();
+        };
+
+        ws.onclose = () => {
+          if (!isCancelled && !eventSource) {
+            startSSE();
+          }
+        };
+      } catch {
+        startSSE();
       }
     }
 
     return () => {
+      isCancelled = true;
       clearInterval(interval);
+      if (ws) ws.close();
       if (eventSource) eventSource.close();
     };
   }, []);
@@ -258,17 +290,16 @@ export default function OverviewPage() {
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
             <h1 className={styles.pageTitle}>Observability Command Center</h1>
             <span style={{
-              background: 'linear-gradient(135deg, rgba(215, 38, 56, 0.2), rgba(255, 90, 31, 0.2))',
-              border: '1px solid rgba(215, 38, 56, 0.4)',
-              color: '#ff6b7b',
+              background: isLiveConnected ? 'rgba(34, 197, 94, 0.12)' : 'rgba(148, 163, 184, 0.12)',
+              border: `1px solid ${isLiveConnected ? 'rgba(34, 197, 94, 0.4)' : 'rgba(148, 163, 184, 0.3)'}`,
+              color: isLiveConnected ? '#4ade80' : '#94a3b8',
               fontSize: '0.75rem',
-              fontWeight: 700,
+              fontWeight: 600,
               padding: '2px 8px',
               borderRadius: '6px',
-              textTransform: 'uppercase',
-              letterSpacing: '0.05em'
+              letterSpacing: '0.04em'
             }}>
-              Tier S (9.2+)
+              {isLiveConnected ? '● Live Stream' : '○ Polling Active'}
             </span>
           </div>
           <p className={styles.pageSubtitle}>

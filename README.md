@@ -61,17 +61,17 @@ Darkrai is an event-driven GitHub automation platform that ingests repository we
 ### Frontend
 - Next.js 15 (App Router)
 - React 18 & Lucide Icons
-- Server-Sent Events (SSE) & Real-Time WebSockets
-- Magma Dark Luxury CSS Design System
+- Server-Sent Events (SSE) & WebSockets with resilient polling fallback
+- Clean Dark Theme UI (CSS Modules)
 
 ### Backend
 - FastAPI & Starlette Async WebSockets
-- Distributed Queue (Redis Async with in-process asyncio fallback)
+- Background Task Queue (Redis Async with in-memory asyncio fallback)
 - Transactional Outbox Recovery Scanner
-- Python AST (`ast`) Static Security Engine
-- AI PR Review Engine (Google Gemini / OpenAI / Heuristic)
+- Python AST (`ast`) Static Security Analyzer (supports raw code and unified PR diffs)
+- AI PR Review Engine (Google Gemini / OpenAI / Heuristic fallback)
 - SQLAlchemy 2.0 Async (PostgreSQL + aiosqlite fallback)
-- Pytest & Pytest-Asyncio (41 Unit & Integration Tests)
+- Pytest & Pytest-Asyncio (44 Unit & Integration Tests)
 
 ### Infrastructure & CI/CD
 - GitHub Actions CI (`.github/workflows/ci.yml`)
@@ -122,7 +122,7 @@ npm run dev
 ```bash
 pytest backend/app/tests -v
 ```
-> Executes 41 unit and integration tests verifying secret validation fail-fast, webhook HMAC verification and streaming size limits, delivery deduplication, tenant telemetry isolation, AST security audits, AI code review, atomic claiming, explicit worker lease ownership & active renewal, two-phase action execution idempotency with external side-effect crash reconciliation, cookie CSRF protection, and DLQ replay. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for full production operations and runbook.
+> Executes 44 unit and integration tests verifying secret validation fail-fast, webhook HMAC verification and streaming size limits, delivery deduplication, tenant telemetry isolation, AST security audits on code and Git unified diffs, AI code review, atomic claiming, explicit worker lease ownership & active renewal, action execution idempotency with crash reconciliation, cookie CSRF protection, and DLQ replay. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for production operations and runbook.
 
 ---
 

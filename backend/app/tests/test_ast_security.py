@@ -100,3 +100,37 @@ def test_ast_linter_syntax_error_handling():
     assert report.is_safe is False
     assert report.parse_error is not None
     assert "AST_SYNTAX_ERROR" in [f.rule_id for f in report.findings]
+
+def test_ast_linter_git_unified_diff_safe():
+    git_diff = """diff --git a/backend/app/utils/calc.py b/backend/app/utils/calc.py
+index 1234567..89abcdef 100644
+--- a/backend/app/utils/calc.py
++++ b/backend/app/utils/calc.py
+@@ -10,4 +10,6 @@ def compute_total(values: list[float]) -> float:
+     subtotal = sum(values)
+-    return subtotal
++    tax = subtotal * 0.05
++    return subtotal + tax
+"""
+    report = ASTSecurityLinter.analyze_code(git_diff, filename="PR_42.py")
+    assert report.is_safe is True
+    assert report.risk_score == 0
+    assert report.total_findings == 0
+    assert report.parse_error is None
+
+def test_ast_linter_git_unified_diff_vulnerable():
+    git_diff = """diff --git a/backend/app/handler.py b/backend/app/handler.py
+index abcdef1..0123456 100644
+--- a/backend/app/handler.py
++++ b/backend/app/handler.py
+@@ -15,3 +15,6 @@ def handle_event(payload: dict):
+     action = payload.get("action")
++    user_code = payload.get("code")
++    eval(user_code)
++    return True
+"""
+    report = ASTSecurityLinter.analyze_code(git_diff, filename="PR_99.py")
+    assert report.is_safe is False
+    assert report.risk_score >= 40
+    rule_ids = [f.rule_id for f in report.findings]
+    assert "AST_SEC_001_DANGEROUS_EXEC" in rule_ids

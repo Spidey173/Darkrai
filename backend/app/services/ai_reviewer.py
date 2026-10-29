@@ -83,9 +83,17 @@ class AIReviewer:
     @classmethod
     def _extract_code_structure(cls, code: str) -> Dict[str, Any]:
         """Extracts declared functions, classes, and imports to assess test coverage gaps."""
-        functions = re.findall(r"def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", code)
-        classes = re.findall(r"class\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[:\(]", code)
-        imports = re.findall(r"(?:from\s+([a-zA-Z0-9_\.]+)\s+import|import\s+([a-zA-Z0-9_\.]+))", code)
+        effective_code = code
+        if ASTSecurityLinter.is_unified_diff(code):
+            added_lines = [
+                line[1:] for line in code.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+            ]
+            effective_code = "\n".join(added_lines)
+
+        functions = re.findall(r"def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", effective_code)
+        classes = re.findall(r"class\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[:\(]", effective_code)
+        imports = re.findall(r"(?:from\s+([a-zA-Z0-9_\.]+)\s+import|import\s+([a-zA-Z0-9_\.]+))", effective_code)
         flattened_imports = [imp[0] or imp[1] for imp in imports if (imp[0] or imp[1])]
 
         return {

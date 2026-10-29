@@ -44,7 +44,7 @@ async def get_current_user(
     if not session_token:
         if is_bearer:
             session_token = auth_header[7:].strip()
-    if not session_token:
+    if not session_token and request.method in ("GET", "HEAD"):
         session_token = request.query_params.get("token")
 
     if not session_token:

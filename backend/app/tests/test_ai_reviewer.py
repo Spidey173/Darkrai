@@ -46,3 +46,29 @@ def execute_debug_hook(user_input: str):
     assert "review:blocker" in result["suggested_labels"]
     assert "CRITICAL" in result["review_comment"]
     assert "Block Merge" in result["review_comment"]
+
+@pytest.mark.asyncio
+async def test_ai_reviewer_git_unified_diff():
+    git_diff = """diff --git a/backend/app/services/calculator.py b/backend/app/services/calculator.py
+index abc1234..def5678 100644
+--- a/backend/app/services/calculator.py
++++ b/backend/app/services/calculator.py
+@@ -1,4 +1,7 @@
+ def add(a: int, b: int) -> int:
+-    return a
++    return a + b
++
++def multiply(a: int, b: int) -> int:
++    return a * b
+"""
+    result = await AIReviewer.review_pull_request(
+        pr_title="feat(math): implement multiply helper",
+        pr_body="Adds multiply operation for math service.",
+        diff_or_code=git_diff,
+        filename="calculator.py"
+    )
+
+    assert result["is_safe"] is True
+    assert result["risk_score"] == 0
+    assert "security:verified" in result["suggested_labels"]
+    assert "kind:feature" in result["suggested_labels"]

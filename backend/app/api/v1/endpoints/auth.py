@@ -108,24 +108,22 @@ async def github_callback(
             detail="Missing code or state parameters."
         )
 
-    # 2. Verify state token matching (dual layer: matching cookie OR valid HMAC signature)
-    cookie_state = request.cookies.get(STATE_COOKIE_NAME)
-    cookie_valid = bool(cookie_state and cookie_state == state)
+    # 2. Cryptographic state verification & CSRF defense
     hmac_valid = verify_oauth_state(state, settings.SECRET_KEY, max_age=STATE_EXPIRY_SECONDS)
-
-    if not cookie_valid and not hmac_valid:
-        logger.warning(
-            "OAuth state verification failed. Cookie present: %s, match: %s, HMAC valid: %s",
-            bool(cookie_state),
-            cookie_state == state if cookie_state else False,
-            hmac_valid
-        )
+    if not hmac_valid:
+        logger.warning("OAuth state HMAC signature validation failed.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "OAuth state validation failed: state cookie missing or mismatched. "
-                "Ensure your GitHub OAuth App Authorization Callback URL matches your current domain."
-            )
+            detail="OAuth state verification failed: invalid or expired state token."
+        )
+
+    cookie_state = request.cookies.get(STATE_COOKIE_NAME)
+    # If a state cookie is present in the browser, it must strictly match the query parameter
+    if cookie_state and cookie_state != state:
+        logger.warning("OAuth state cookie mismatch detected (possible CSRF). Cookie: %s, State: %s", cookie_state, state)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth state verification failed: state cookie mismatch."
         )
 
     # 3. Exchange code for access tokens
