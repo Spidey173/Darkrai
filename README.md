@@ -18,7 +18,7 @@
 | **Problem** | Brittle regex checkers produce excessive false alerts on benign variable names while missing multi-line injection flaws, and synchronous webhook handlers crash or drop events during GitHub traffic bursts. |
 | **Architecture** | **Asynchronous FastAPI webhook gateway** with sub-5ms HMAC-SHA256 signature verification over raw request bytes, **Transactional Outbox** pattern with lease recovery, **Redis worker queue with Dead Letter Queue (DLQ)**, and formal **Python Abstract Syntax Tree (`ast`) inspection**. |
 | **Evidence & Benchmarks** | **Sub-5ms** webhook HMAC signature verification and ingestion latency under burst load, zero dropped events across worker crashes via outbox lease recovery, verified by **44 automated Pytests**. |
-| **Scope & Boundaries** | **Simulated Event Streams**: Replayed & synthetic GitHub webhook payloads (push, PR, secret leaks) with valid and malformed signatures. **Deployment**: Next.js 16 real-time monitoring console live on Vercel with simulated SSE event streams; FastAPI worker and Redis queue run in local container environment. |
+| **Scope & Boundaries** | **Simulated Event Streams**: Replayed & synthetic GitHub webhook burst payloads (push, PR, secret leaks) with valid and malformed signatures. **Local Benchmark Environment**: Sub-5ms webhook HMAC-SHA256 signature verification and ingestion under burst load in local benchmark environment. **Live UI + Local Backend**: Next.js 16 real-time monitoring console live on Vercel with simulated SSE event streams; FastAPI background worker and Redis queue run in local container backend. |
 | **Verified Test Suite** | **44 / 44 Pytests passing** (HMAC validation, queue retries, outbox recovery, AST vulnerability detection). |
 
 ---
